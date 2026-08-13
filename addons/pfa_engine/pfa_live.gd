@@ -171,6 +171,11 @@ func _handle_message(msg: Dictionary) -> void:
 				pfa.unduck(str(ev), float(msg.get("fade", 0.1)))
 		"welcome":
 			_log("[PFA Live] Server: %s v%s" % [str(msg.get("message", "")), str(msg.get("version", ""))])
+			# Late-join master handshake: a client that connects after the editor's
+			# master fader moved learns the current value (absent on old editors ⇒
+			# no-op — the bare welcome stays a zero-call message). JS parity.
+			if msg.has("master_volume"):
+				pfa.set_master_volume(float(msg["master_volume"]))
 		_:
 			pass  # forward compat — ignore types we don't know
 

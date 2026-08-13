@@ -128,7 +128,10 @@ var _group_mute: bool = false
 var _bank_loader: PFABankLoader = null
 var _samples_loaded: bool = false
 var _play_start_time: float = 0.0
-var _last_trigger_time_ms: float = 0.0
+## −∞ epoch, NOT 0.0: ticks start at process launch, so a 0.0 init silently muted
+## any event whose cooldown_ms exceeded the game's uptime at first trigger
+## (uptime − 0 < cooldown). Found by the sess122 voice-stealing red suite.
+var _last_trigger_time_ms: float = -1.0e12
 var _active_sfx_count: int = 0
 
 # --- Event Gain (anti-click, duck, fadeIn/fadeOut) ---
@@ -147,9 +150,12 @@ var _track_players: Dictionary = {}
 
 ## Per-(track, level) gain state for splice tweens.
 ## _track_level_state[track.name][level_idx] = {
-##   "tween": Tween, "target_amp": float, "start_time": float, "end_time": float, "from_amp": float
+##   "tween": Tween, "target_amp": float, "start_time": float, "end_time": float, "from_amp": float,
+##   "curve": String
 ## }
 ## target_amp here is the pure "level gate" (track.volume if active else 0, pre-event-gain).
+## from/start/end/curve describe the CURRENT fade's full trajectory — enough to hand a live
+## fade over to another variation player (_resume_fade_tween) without restarting it.
 var _track_level_state: Dictionary = {}
 
 ## Per-track "shared" stream state (always_play / level_conditional). { track.name: Dictionary }
@@ -185,6 +191,14 @@ var _transition_gen: int = 0
 
 ## SFX voice list for max_instances tracking: [AudioStreamPlayer]
 var _sfx_voices: Array = []
+
+## Spatial voices of THIS event (AudioStreamPlayer2D|3D), registered by
+## PFASpatial._spawn_voice and unregistered by its _free_voice — so the
+## max_instances cap sees ONE pool: flat + spatial together (JS parity with
+## event._activeVoices, where spatial voices join through a stop/isActive shim).
+var _spatial_voices: Array = []
+## The spatial manager that spawned them (release path for a stolen spatial voice).
+var _spatial_mgr = null
 
 ## Stinger bundles loaded on load_samples(). Keyed by `${src}::${tgt}` connection key.
 ## v2 shape: each bundle = { streams: [AudioStream], clips: [Dictionary], volume: float,
@@ -257,7 +271,9 @@ func start_playback() -> void:
 				"curve": entry_fade_curve,
 			})
 		_set_event_gain_amp(0.0001)
-		_tween_event_gain(volume, entry_fade_dur, entry_fade_curve)
+		# _effective_event_amp(): a fresh start of a live-ducked event settles at
+		# the duck level, not full (duck state survives stop()/start).
+		_tween_event_gain(_effective_event_amp(), entry_fade_dur, entry_fade_curve)
 
 	if use_nodes and not _node_graph_data.is_empty():
 		if not entry_node_id.is_empty():
@@ -375,17 +391,20 @@ func trigger_sfx(options: Dictionary = {}) -> Array:
 		return []
 	if not _samples_loaded:
 		load_samples()
-	if not _check_can_trigger():
-		return []
-
-	# SFX: no event-gain anti-click ramp, just set active.
-	_set_event_gain_amp(volume)
 
 	# Intensity / velocity → per-voice gain + pitch (over the random variation).
 	# Resolved ONCE here (the event owns the curve config); every track voice for
 	# this trigger gets the same offset. Neutral {1,0} when disabled/absent. A bare
-	# trigger (no intensity key) ⇒ 1.0 (full-strength hit).
+	# trigger (no intensity key) ⇒ 1.0 (full-strength hit). Resolved BEFORE the cap
+	# gate — the candidate's audibility score needs it (voice stealing, sess122).
 	var iv: Dictionary = PFATrack.intensity_gain_pitch(float(options.get("intensity", 1.0)), intensity)
+
+	if not _check_can_trigger(float(iv.get("gain_mult", 1.0)) * _max_track_volume(), 1.0, tracks.size()):
+		return []
+
+	# SFX: no event-gain anti-click ramp, just set active. _effective_event_amp()
+	# (not raw volume) so a re-fired one-shot honors an active live duck.
+	_set_event_gain_amp(_effective_event_amp())
 
 	var played: Array = []
 	for track in tracks:
@@ -496,7 +515,8 @@ func toggle_sub_level(sub_name: String, enabled: bool, fade_dur: float = 0.5) ->
 ## Fade in (for crossfade between events). JS: fadeIn()
 func fade_in(duration: float, curve: String = "equal_power") -> void:
 	_set_event_gain_amp(0.0001)
-	_tween_event_gain(volume, duration, curve)
+	# _effective_event_amp(): fading in while live-ducked ramps to the duck level.
+	_tween_event_gain(_effective_event_amp(), duration, curve)
 
 ## Fade out and stop, honoring the current node's terminal_fade if present (Transition
 ## Kinds v2 — dangling fade_out at graph end, flattened by the exporter as metadata on
@@ -539,6 +559,15 @@ func fade_out(duration: float, curve: String = "equal_power") -> void:
 			ev.stop_playback()
 	)
 
+## Effective event amp honoring an active live duck (editor mute/solo ride duck):
+## while ducked the duck target REPLACES the event volume. This is the
+## combined_sfx_db fold hoisted into a single source, and the exact mirror of
+## JS PFAEvent._eventGainTarget(). Every writer that re-applies the event gain
+## (trigger_sfx / start_playback entry / fade_in) must target THIS, or a re-fired
+## voice silently lifts a live mute — the web solo/mute regression, same class.
+func _effective_event_amp() -> float:
+	return _duck_target_amp if _duck_target_amp >= 0.0 else volume
+
 ## Duck event volume (remembers original). JS: duck()
 func duck(to: float = 0.3, fade: float = 0.5) -> void:
 	if _duck_saved_volume < 0:
@@ -558,8 +587,16 @@ func unduck(fade: float = 0.5) -> void:
 ## Set volume (called by PFA.set_event_volume).
 func set_volume(v: float) -> void:
 	volume = v
-	# Update all active players by applying current event gain.
-	_apply_event_gain_to_all_active()
+	# JS parity (_updateGain): re-target the LIVE event gain. The audible chain
+	# reads _event_gain_amp — `volume` is only baked in at play/trigger/fade_in
+	# time, so a sustained music event must follow the mixer fader HERE (the
+	# per-event fader was dead on playing music while the group fader — a live
+	# _group_volume fold — worked). Kill any running event-gain tween first
+	# (mirrors JS cancelScheduledValues) and honor an active live duck via
+	# _effective_event_amp so a fader move can't lift a live mute.
+	if _event_gain_tween and _event_gain_tween.is_valid():
+		_event_gain_tween.kill()
+	_set_event_gain_amp(_effective_event_amp())
 
 ## Get current node ID.
 func get_current_node_id() -> String:
@@ -1374,10 +1411,45 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 		var lvl_state: Dictionary = _track_level_state.get(track.name, {}).get(level, {})
 		track_target_amp = float(lvl_state.get("target_amp", 0.0))
 
-	# Kill any level tween still in flight — we're taking over both players' volume for MICRO_FADE.
 	var lvl_state_map: Dictionary = _track_level_state.get(track.name, {})
 	var cur_lvl_state: Dictionary = lvl_state_map.get(level, {})
 	var prev_tween: Tween = cur_lvl_state.get("tween", null)
+
+	# A LIVE long fade on this lane (chance fade, long level fade) must SURVIVE the
+	# swap — web parity: there the fade lives on a separate levelGain node the
+	# variation crossfade never touches, so a switch mid-fade keeps ramping. Godot
+	# folds both gates into one volume_db knob, so hand the fade over instead of
+	# stomping it: the NEW player resumes the ORIGINAL trajectory (same from/target/
+	# window/curve, stored in cur_lvl_state) under a 30 ms equal-power onset while
+	# the OLD player micro-fades out. Gate on "remaining window > micro-xfade":
+	# anything shorter is audibly identical to the plain swap, so the common settled
+	# case (and the 30 ms stamps written by previous swaps) stays byte-identical.
+	# Shared lanes never store level-fade state here (their dict is empty → no
+	# valid prev_tween), so this branch is level_specific-only by construction.
+	var now: float = _now()
+	var fade_end: float = float(cur_lvl_state.get("end_time", 0.0))
+	if not is_shared and prev_tween and prev_tween.is_valid() \
+			and fade_end - now > _MICRO_FADE_SEC:
+		var fade_start: float = float(cur_lvl_state.get("start_time", now))
+		var fade_from: float = float(cur_lvl_state.get("from_amp", 0.0))
+		var fade_target: float = float(cur_lvl_state.get("target_amp", track_target_amp))
+		var fade_curve: String = str(cur_lvl_state.get("curve", "equal_power"))
+		prev_tween.kill()
+		_equal_power_tween_to_amp(old_player, 0.0, _MICRO_FADE_SEC)
+		var resumed: Tween = _resume_fade_tween(new_player, fade_from, fade_target,
+				fade_start, fade_end, fade_curve)
+		_track_players[track.name][level]["active"] = new_variation
+		lvl_state_map[level] = {
+			"target_amp": fade_target, "tween": resumed,
+			"start_time": fade_start, "end_time": fade_end, "from_amp": fade_from,
+			"curve": fade_curve,
+		}
+		_track_level_state[track.name] = lvl_state_map
+		print("[PFA] Variation switch: %s L%d: %d → %d (live fade handed over, %.2fs left)"
+				% [track.name, level, old_variation, new_variation, fade_end - now])
+		return
+
+	# Kill any level tween still in flight — we're taking over both players' volume for MICRO_FADE.
 	if prev_tween and prev_tween.is_valid():
 		prev_tween.kill()
 
@@ -1397,6 +1469,7 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 	lvl_state_map[level] = {
 		"target_amp": track_target_amp, "tween": new_tween,
 		"start_time": _now(), "end_time": _now() + _MICRO_FADE_SEC, "from_amp": track_target_amp,
+		"curve": "equal_power",
 	}
 	_track_level_state[track.name] = lvl_state_map
 	print("[PFA] Variation switch: %s L%d: %d → %d" % [track.name, level, old_variation, new_variation])
@@ -1445,6 +1518,7 @@ func _prestart_track_level_specific(track: PFATrack, offset_seconds: float) -> v
 			_track_level_state[track.name][int(level_idx)] = {
 				"target_amp": 0.0, "tween": null,
 				"start_time": _now(), "end_time": _now(), "from_amp": 0.0,
+				"curve": "equal_power",
 			}
 	_track_players[track.name] = level_map
 
@@ -1542,6 +1616,7 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 			lvl_state_map[level] = {
 				"target_amp": target_amp, "tween": null,
 				"start_time": _now(), "end_time": _now(), "from_amp": target_amp,
+				"curve": curve,
 			}
 			_track_level_state[track.name] = lvl_state_map
 			return
@@ -1551,6 +1626,7 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 	lvl_state_map[level] = {
 		"target_amp": target_amp, "tween": tween,
 		"start_time": _now(), "end_time": _now() + fd, "from_amp": start_amp,
+		"curve": curve,
 	}
 	_track_level_state[track.name] = lvl_state_map
 
@@ -1616,6 +1692,51 @@ func _equal_power_tween_to_amp(player: AudioStreamPlayer, target_amp: float, dur
 		var with_factor: float = amp * _event_group_master_factor()
 		player.volume_db = _amp_to_db(with_factor)
 	, 0.0, 1.0, duration)
+	return tween
+
+## Resume an in-flight level fade on ANOTHER player (variation handover).
+## Replays the ORIGINAL trajectory — from_amp → target_amp over [start_time,
+## end_time] with `curve` — picking it up at the current moment, so the fade
+## completes on its original clock as if never interrupted (web parity: the
+## levelGain keeps ramping under the variation crossfade). The first
+## _MICRO_FADE_SEC multiplies in an equal-power sin onset: the destination
+## player rises 0→trajectory while the outgoing player cos-decays to 0
+## (_equal_power_tween_to_amp) — constant combined power, no step on either
+## side. Same ownership rule as _equal_power_tween_to_amp: the tween is bound
+## to the player so it dies with it; the caller stores + kills the return.
+func _resume_fade_tween(player: AudioStreamPlayer, from_amp: float, target_amp: float,
+		start_time: float, end_time: float, curve: String = "equal_power") -> Tween:
+	if not is_instance_valid(player):
+		return null
+	var now: float = _now()
+	var full: float = end_time - start_time
+	var remaining: float = end_time - now
+	if full <= 0.0 or remaining <= 0.0:
+		return _equal_power_tween_to_amp(player, target_amp, _MICRO_FADE_SEC, curve)
+	var is_fade_in: bool = target_amp > from_amp
+	var p0: float = clampf((now - start_time) / full, 0.0, 1.0)
+	var tween: Tween = player.create_tween()
+	tween.tween_method(func(t: float):
+		if not is_instance_valid(player):
+			return
+		# Continue the original parameterization: p spans [p0..1] over the remaining window.
+		var p: float = p0 + (1.0 - p0) * t
+		var shape: float
+		if is_fade_in:
+			shape = _eval_fade_in_curve(p, curve)
+		else:
+			shape = _eval_fade_in_curve(1.0 - p, curve)
+		var amp: float
+		if is_fade_in:
+			amp = from_amp + (target_amp - from_amp) * shape
+		else:
+			amp = target_amp + (from_amp - target_amp) * shape
+		var elapsed: float = t * remaining
+		if elapsed < _MICRO_FADE_SEC:
+			amp *= sin(elapsed / _MICRO_FADE_SEC * PI / 2.0)
+		var with_factor: float = amp * _event_group_master_factor()
+		player.volume_db = _amp_to_db(with_factor)
+	, 0.0, 1.0, remaining)
 	return tween
 
 ## Decode a player's current volume_db back to pre-event-gain amp (so tween continues smoothly).
@@ -1934,18 +2055,128 @@ func _pick_stinger_variant(bundle: Dictionary) -> int:
 # ── SFX ───────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
-func _check_can_trigger() -> bool:
+## Cooldown + max_instances gate — voice stealing by AUDIBILITY (sess122; spawn-
+## size steal sess124).
+##
+## ONE pool per event: flat (_sfx_voices) + spatial (_spatial_voices) count together.
+## Score = pre_amp (track × clip × rand × intensity, spawn meta) × distance factor
+## (spatial voices only — PFASpatial._voice_score; flat = gain alone). A trigger
+## spawns ONE VOICE PER TRACK, so the gate frees room for the WHOLE spawn
+## (`spawn_count`; the old single-victim gate grew the pool net +N−1 per trigger
+## on multi-track events). At the cap:
+##   • victims = the `spawn_count` least audible live voices (score asc, equal
+##     scores → oldest by spawn_us — byte-parity with the age-only steal in
+##     homogeneous scenes), clamped to the live pool;
+##   • candidate strictly quieter than the LOUDEST would-be victim → REJECT (it
+##     would be inaudible anyway, and must not kill a voice that isn't) — no
+##     cooldown stamp, a rejected trigger is a non-event; with spawn_count 1 this
+##     is exactly the old single-victim rule;
+##   • otherwise every victim dies through an ANTI-CLICK seam (spatial: the
+##     _STOP_FLOOR_SEC floor; flat: _release_sfx_voice silence ramp) — never the
+##     authored release_fade. A steal is not an authored stop: borrowing the
+##     authored fade kept slot-free voices audible ~574 ms past eviction, so
+##     "audible ≤ cap" broke and a smaller cap could ring LOUDER than a bigger
+##     one (sess125 defect B). Authored release stays on game stop()/destroy().
+## cap <= 0 ⇒ uncapped (the documented spatial semantic, now unified).
+## `candidate_amp/_dist` default to 1.0 — an optimistic candidate estimate (clip
+## volume / rand unknown until the variation pick) so rejection stays conservative.
+## JS: _checkCanTrigger (1f4fdd1).
+func _check_can_trigger(candidate_amp: float = 1.0, candidate_dist: float = 1.0,
+		spawn_count: int = 1) -> bool:
 	var now_ms: float = Time.get_ticks_msec()
 	if cooldown_ms > 0.0 and (now_ms - _last_trigger_time_ms) < cooldown_ms:
 		return false
-	_last_trigger_time_ms = now_ms
 	_cleanup_sfx_voices()
-	if _sfx_voices.size() >= max_instances:
-		var oldest: AudioStreamPlayer = _sfx_voices.pop_front()
-		if is_instance_valid(oldest):
-			oldest.stop()
-			oldest.queue_free()
+	_cleanup_spatial_refs()
+	var cap: int = int(max_instances)
+	if cap > 0:
+		var live: Array = []   # [ {score, spawn_us, i, player, spatial} ]
+		for p in _sfx_voices:
+			if is_instance_valid(p):
+				live.append({"score": float(p.get_meta("pre_amp", 1.0)),
+					"spawn_us": int(p.get_meta("spawn_us", 0)), "i": live.size(),
+					"player": p, "spatial": false})
+		for p in _spatial_voices:
+			live.append({"score": _spatial_mgr._voice_score(p) if _spatial_mgr != null else \
+				float(p.get_meta("pre_amp", 1.0)),
+				"spawn_us": int(p.get_meta("spawn_us", 0)), "i": live.size(),
+				"player": p, "spatial": true})
+		var needed: int = mini(live.size() + spawn_count - cap, live.size())
+		if needed > 0:
+			live.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+				if a["score"] != b["score"]:
+					return a["score"] < b["score"]
+				if a["spawn_us"] != b["spawn_us"]:
+					return a["spawn_us"] < b["spawn_us"]
+				return a["i"] < b["i"])
+			if candidate_amp * candidate_dist < live[needed - 1]["score"]:
+				return false   # honest rejection — no stamp, nothing dies
+			for k in needed:
+				var v: Dictionary = live[k]
+				if v["spatial"]:
+					# 0.0 = "as fast as click-free allows" (_STOP_FLOOR_SEC), NOT
+					# -1.0 = the authored release_fade — that fade belongs to
+					# game-driven stop()/destroy() only (sess125 defect B).
+					_spatial_mgr._release_voice(v["player"], 0.0)
+				else:
+					_release_sfx_voice(v["player"])
+	_last_trigger_time_ms = now_ms
 	return true
+
+
+## Drop dead / mid-release spatial registrations (the release ramp owns those voices;
+## they no longer hold a cap slot). _free_voice unregisters on the normal lifecycle.
+func _cleanup_spatial_refs() -> void:
+	var alive: Array = []
+	for p in _spatial_voices:
+		if is_instance_valid(p) and not bool(p.get_meta("stopped", false)):
+			alive.append(p)
+	_spatial_voices = alive
+
+
+func _register_spatial_voice(p, mgr) -> void:
+	_spatial_mgr = mgr
+	_spatial_voices.append(p)
+
+
+func _unregister_spatial_voice(p) -> void:
+	_spatial_voices.erase(p)
+
+
+## Optimistic candidate loudness base: the loudest track this trigger could spawn.
+func _max_track_volume() -> float:
+	var m: float = 0.0
+	for t in tracks:
+		m = maxf(m, float(t.volume))
+	return m if m > 0.0 else 1.0
+
+
+## Click-free steal of a FLAT voice — the stop_sfx_voices pattern scaled to one
+## player: leave the pool at once (the slot frees now), ramp to the −80 floor over
+## an anti-click seam, and let the voice's OWN trim-stop / finished handler free it
+## (single-owner rule — no extra freer that could race a captured player). A voice
+## still waiting on its delay timer has made no sound — free it outright.
+func _release_sfx_voice(player) -> void:
+	_sfx_voices.erase(player)
+	if not is_instance_valid(player):
+		return
+	if not bool(player.get_meta("sfx_started", false)):
+		player.queue_free()
+		return
+	player.set_meta("stopped", true)
+	if player.has_meta("sfx_tw"):
+		var old = player.get_meta("sfx_tw")
+		if old != null and is_instance_valid(old):
+			old.kill()
+	var start_amp: float = db_to_linear(player.volume_db)
+	var setter := func(t: float) -> void:
+		if not is_instance_valid(player):
+			return
+		var amp: float = start_amp * (1.0 - t)
+		player.volume_db = maxf(linear_to_db(maxf(amp, 0.000001)), -80.0)
+	var tw: Tween = player.create_tween()
+	player.set_meta("sfx_tw", tw)
+	tw.tween_method(setter, 0.0, 1.0, 0.02)   # 20 ms anti-click seam (JS parity)
 
 ## Trigger one SFX voice for a track. Returns a play-report dict carrying the player
 ## ({ player, track, behavior, variation, variation_count, algo, sample }) or {} when the
@@ -1981,6 +2212,10 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 	var vol_rand: float = track.sfx_volume_rand_linear()
 	var clip_vol: float = clip.volume if clip != null else 1.0
 	var steady_amp: float = track.volume * clip_vol * vol_rand * float(iv.get("gain_mult", 1.0))
+	# Audibility-score meta (voice stealing): the steady programmatic gain + the age
+	# tie-break. Flat voices have no distance factor — the gain IS the score.
+	player.set_meta("pre_amp", steady_amp)
+	player.set_meta("spawn_us", Time.get_ticks_usec())
 
 	# Trim window [offset, offset + play_len). play_len 0 → full remaining after offset.
 	var offset: float = clip.source_offset if clip != null else 0.0
@@ -2246,7 +2481,7 @@ func combined_sfx_db(pre_amp: float) -> float:
 	# While ducked, the duck target REPLACES the event volume (mirrors the music
 	# gain, which duck tweens to that absolute level) — live mute/solo from the
 	# editor ride duck, so spatial voices must fold it too.
-	var ev_amp: float = _duck_target_amp if _duck_target_amp >= 0.0 else volume
+	var ev_amp: float = _effective_event_amp()
 	return _amp_to_db(pre_amp * ev_amp * _group_volume * _master_volume)
 
 func _event_group_master_factor() -> float:

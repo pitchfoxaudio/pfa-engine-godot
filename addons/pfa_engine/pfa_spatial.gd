@@ -139,14 +139,15 @@ func _trigger_oneshot(event, mode: String, pos: Vector3, config: Dictionary) -> 
 		return null
 	if not event._samples_loaded:
 		event.load_samples()
-	if not event._check_can_trigger():
-		return null
-	_enforce_max_instances(event)
 	var cfg := _merge_cfg(_event_spatial(event), config)
 	cfg["mode"] = mode
 	# Per-trigger intensity / velocity: game passes config.intensity (0..1), the event's
 	# authored curve maps it. Carried in cfg so every spawned/re-looped voice shares it.
+	# Resolved BEFORE the cap gate — the candidate's audibility score needs it.
 	cfg["_intensity"] = PFATrack.intensity_gain_pitch(float(config.get("intensity", 1.0)), event.intensity)
+	var cand_amp: float = float(cfg["_intensity"].get("gain_mult", 1.0)) * event._max_track_volume()
+	if not event._check_can_trigger(cand_amp, _att_at(mode, pos, cfg), event.tracks.size()):
+		return null
 	return _trigger_tracks(event, mode, pos, cfg, _release_ms_for(event), null)
 
 
@@ -157,33 +158,90 @@ func _trigger_on_emitter(emitter: PFASpatialEmitter, event_name: String) -> Obje
 		return null
 	if not event._samples_loaded:
 		event.load_samples()
-	if not event._check_can_trigger():
-		return null
-	_enforce_max_instances(event)
 	var cfg := _merge_cfg(_event_spatial(event), emitter._cfg)
 	cfg["mode"] = emitter._mode      # emitter mode is fixed at creation
 	cfg["_intensity"] = PFATrack.intensity_gain_pitch(float(emitter._cfg.get("intensity", 1.0)), event.intensity)
+	var cand_amp: float = float(cfg["_intensity"].get("gain_mult", 1.0)) * event._max_track_volume()
+	if not event._check_can_trigger(cand_amp, _att_at(emitter._mode, emitter._pos, cfg), event.tracks.size()):
+		return null
 	return _trigger_tracks(event, emitter._mode, emitter._pos, cfg, _release_ms_for(event), emitter)
 
 
-## JS-parity voice cap (PFAEvent._checkCanTrigger): pfa_event's own max_instances check
-## counts _sfx_voices, which spatial voices never join — so a spatial event was effectively
-## unbounded (sess17 gap; e.g. 12 rolling balls = 12 live loop voices, where the web engine
-## holds 8). Count THIS event's live (non-releasing) voices; at the cap, release the oldest
-## through its authored release_fade / anti-click floor — the steal itself is click-free.
-## Mirrors JS shift()+stop(): one eviction per trigger, on the INITIAL trigger path only
-## (smart re-loop cycles replace their own voice and are not re-capped, as in JS).
-func _enforce_max_instances(event) -> void:
-	var cap: int = int(event.max_instances)
-	if cap <= 0:
-		return
-	var live: Array = []
-	for p in _voices:
-		if is_instance_valid(p) and not bool(p.get_meta("stopped", false)) \
-				and p.get_meta("event", null) == event:
-			live.append(p)
-	if live.size() >= cap:
-		_release_voice(live[0], -1.0)   # oldest first; -1 ⇒ authored release, floored
+# ══════════════════════════════════════════════════════════════════════
+# ── Audibility scoring (voice stealing, sess122) ──────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#
+# The cap itself lives in PFAEvent._check_can_trigger — ONE pool per event, flat +
+# spatial voices together (JS parity: the web engine keeps a single _activeVoices).
+# This section only supplies the spatial half of the score: each voice's steady
+# programmatic gain (meta pre_amp = track × clip × rand × intensity) shaded by the
+# engine's OWN attenuation curve at the voice's current distance from the listener.
+# Godot applies its native attenuation on playback; this curve is for RANKING only,
+# so JS-formula parity (incl. the 10% boundary taper) is the right choice — both
+# engines then rank identically from the same authored config.
+
+## Full audibility score of a live spatial voice (meta written by _spawn_voice).
+func _voice_score(p) -> float:
+	return float(p.get_meta("pre_amp", 1.0)) * _distance_factor(p)
+
+
+## Distance shading for a live voice: 1.0 when no PFA listener exists (the game
+## drives Godot's own camera/listener — distance unknown, rank on gain alone).
+func _distance_factor(p) -> float:
+	var att: Dictionary = p.get_meta("att", {})
+	if att.is_empty():
+		return 1.0
+	if str(p.get_meta("spatial_mode", "2D")) == "3D":
+		if _listener_3d == null or not is_instance_valid(_listener_3d) or not p.is_inside_tree():
+			return 1.0
+		return attenuation_gain(p.global_position.distance_to(_listener_3d.global_position), att)
+	if _listener_2d == null or not is_instance_valid(_listener_2d) or not p.is_inside_tree():
+		return 1.0
+	var px: float = p.global_position.distance_to(_listener_2d.global_position)
+	return attenuation_gain(px / _world_scale, att)
+
+
+## Candidate score shading at a would-be spawn position (game units / pixels).
+func _att_at(mode: String, pos: Vector3, cfg: Dictionary) -> float:
+	var att := {"model": str(cfg.get("model", "inverse")),
+		"min_distance": float(cfg.get("min_distance", 1.0)),
+		"max_distance": float(cfg.get("max_distance", 50.0)),
+		"rolloff": float(cfg.get("rolloff", 1.0))}
+	if mode == "3D":
+		if _listener_3d == null or not is_instance_valid(_listener_3d):
+			return 1.0
+		return attenuation_gain((pos / _world_scale).distance_to(_listener_3d.global_position), att)
+	if _listener_2d == null or not is_instance_valid(_listener_2d):
+		return 1.0
+	var px: float = Vector2(pos.x, pos.y).distance_to(_listener_2d.global_position)
+	return attenuation_gain(px / _world_scale, att)
+
+
+## JS _computeDistanceAttenuation port (index.js) — distance in audio units.
+## Inverse / linear / exponential + the web path's 10% boundary taper to 0 at
+## max_distance. Pure function (static) — unit-tested directly.
+static func attenuation_gain(distance: float, att: Dictionary) -> float:
+	var min_d: float = maxf(0.0001, float(att.get("min_distance", 1.0)))
+	var max_d: float = float(att.get("max_distance", 50.0))
+	var rolloff: float = float(att.get("rolloff", 1.0))
+	if distance <= min_d:
+		return 1.0
+	if max_d > 0.0 and distance >= max_d:
+		return 0.0
+	var gain: float
+	match str(att.get("model", "inverse")):
+		"linear":
+			gain = 1.0 if max_d <= min_d else \
+				maxf(0.0, 1.0 - rolloff * (distance - min_d) / (max_d - min_d))
+		"exponential":
+			gain = pow(distance / min_d, -rolloff)
+		_:
+			gain = min_d / (min_d + rolloff * (distance - min_d))
+	if max_d > 0.0:
+		var taper_start: float = max_d * 0.9
+		if distance > taper_start:
+			gain *= (max_d - distance) / (max_d - taper_start)
+	return gain
 
 
 ## Spawn one voice per track (or, for smart loop, one controller per track). Returns the
@@ -293,13 +351,25 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 	_set_voice_position(player, mode, pos)
 
 	# Per-voice state for the smart re-loop + release fade. `event` + `pre_amp`
-	# let refresh_event_voices re-bake the level on LIVE mixer moves.
+	# let refresh_event_voices re-bake the level on LIVE mixer moves; `pre_amp` is
+	# also the gain half of the audibility score (voice stealing), shaded by `att`
+	# (+ `spatial_mode`) at steal time. `spawn_us` is the age tie-break.
 	player.set_meta("base_db", base_db)
 	player.set_meta("event", event)
 	player.set_meta("pre_amp", base_amp)
 	player.set_meta("play_len", play_len)
 	player.set_meta("release_ms", release_ms)
 	player.set_meta("stopped", false)
+	player.set_meta("spatial_mode", mode)
+	player.set_meta("att", {"model": str(cfg.get("model", "inverse")),
+		"min_distance": float(cfg.get("min_distance", 1.0)),
+		"max_distance": float(cfg.get("max_distance", 50.0)),
+		"rolloff": float(cfg.get("rolloff", 1.0))})
+	player.set_meta("spawn_us", Time.get_ticks_usec())
+	# Register in the EVENT's unified voice pool (flat + spatial share one cap — JS
+	# parity with event._activeVoices). _free_voice unregisters; a mid-release voice
+	# is filtered out by its `stopped` meta.
+	event._register_spatial_voice(player, self)
 
 	# A windowed one-shot is freed by its stop timer ALONE (the finished handler below skips
 	# it). Otherwise a natural stream-end frees the player first, and the stop timer's captured
@@ -385,9 +455,10 @@ func _smart_tick(ctrl: Dictionary, event, track, mode: String, cfg: Dictionary, 
 			ctrl["last_len"] = maxf(0.05, float(next.get_meta("play_len", 1.0)) / maxf(0.01, next.pitch_scale))
 			# Crossfade the new voice in; release the previous over the same seam.
 			var nb: float = float(next.get_meta("base_db", 0.0))
-			next.volume_db = _SILENCE_DB
+			_set_voice_db(next, _SILENCE_DB)
 			var tw: Tween = next.create_tween()
-			tw.tween_property(next, "volume_db", nb, _SMART_CROSS)
+			tw.tween_method(func(db: float) -> void: _set_voice_db(next, db),
+				_SILENCE_DB, nb, _SMART_CROSS)
 			var prev = ctrl.get("active", null)
 			if prev != null and is_instance_valid(prev) and prev.playing:
 				_release_voice(prev, _SMART_CROSS * 1000.0)
@@ -525,12 +596,31 @@ func _set_voice_position(player, mode: String, pos: Vector3) -> void:
 # ── Fades / release / cleanup ─────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
+## Single write path for a voice's level. 3D also pins max_db to the same value:
+## Godot's INVERSE curve keeps GROWING inside unit_size (= min_distance) — e.g.
+## min_distance 5 heard from 0.5 m = +20 dB OVER the authored level, capped only
+## by max_db, which we never set → the node default (+3 dB ABSOLUTE) was the only
+## ceiling. Web/industry semantics hold a PLATEAU at the authored volume inside
+## min_distance instead (the JS engine clamps distance at minDistance; FMOD same).
+## max_db == volume_db turns Godot's cap into exactly that plateau:
+## total = min(volume_db + att, max_db) = volume_db + min(att, 0) — distance can
+## only ever REDUCE a voice. Every volume_db write (spawn, clip fade, live
+## re-bake, release ramp, smart seam) must go through here so the pair never
+## splits. (2D needs none of this: pow(1 − d/max, exp) ≤ 1 by construction.)
+func _set_voice_db(player, db: float) -> void:
+	if not is_instance_valid(player):
+		return
+	player.volume_db = db
+	if player is AudioStreamPlayer3D:
+		player.max_db = db
+
+
 ## One-shot clip fade envelope on volume_db (dB-space ramp — Godot-idiomatic). fade_out is
 ## suppressed for a seamless loop (it would mute the loop after the first pass). JS analog:
 ## _applySfxFadeEnvelope. No fades ⇒ steady base_db.
 func _apply_fade(player, base_db: float, play_len: float, fade_in: float, fade_out: float, seamless: bool) -> void:
 	if fade_in <= 0.0 and (fade_out <= 0.0 or seamless):
-		player.volume_db = base_db
+		_set_voice_db(player, base_db)
 		return
 	# Clamp both fades to fit the window (preserve ratio). JS parity.
 	if play_len > 0.0 and fade_in + fade_out > play_len:
@@ -544,16 +634,15 @@ func _apply_fade(player, base_db: float, play_len: float, fade_in: float, fade_o
 	# per the web reference + FMOD ("linear = solid basic fade"). Mirrors _apply_sfx_fade_to_player.
 	var steady_amp: float = db_to_linear(base_db)
 	var setter := func(amp: float) -> void:
-		if is_instance_valid(player):
-			player.volume_db = linear_to_db(amp) if amp > 0.0001 else _SILENCE_DB
+		_set_voice_db(player, linear_to_db(amp) if amp > 0.0001 else _SILENCE_DB)
 	var tw: Tween = player.create_tween()
 	var cursor: float = 0.0
 	if fade_in > 0.0:
-		player.volume_db = _SILENCE_DB
+		_set_voice_db(player, _SILENCE_DB)
 		tw.tween_method(setter, 0.0, steady_amp, fade_in)
 		cursor = fade_in
 	else:
-		player.volume_db = base_db
+		_set_voice_db(player, base_db)
 	if fade_out > 0.0 and not seamless:
 		var hold: float = maxf(0.0, play_len - fade_out - cursor)
 		if hold > 0.0:
@@ -577,7 +666,8 @@ func _release_voice(player, fade_ms: float) -> void:
 		ms = float(player.get_meta("release_ms", 0.0))
 	ms = maxf(ms, _STOP_FLOOR_SEC * 1000.0)
 	var tw: Tween = player.create_tween()
-	tw.tween_property(player, "volume_db", _SILENCE_DB, ms / 1000.0)
+	tw.tween_method(func(db: float) -> void: _set_voice_db(player, db),
+		player.volume_db, _SILENCE_DB, ms / 1000.0)
 	tw.finished.connect(func() -> void:
 		if is_instance_valid(player):
 			player.stop()
@@ -588,6 +678,9 @@ func _release_voice(player, fade_ms: float) -> void:
 func _free_voice(player) -> void:
 	_voices.erase(player)
 	if is_instance_valid(player):
+		var ev = player.get_meta("event", null)
+		if ev != null and is_instance_valid(ev):
+			ev._unregister_spatial_voice(player)
 		player.queue_free()
 
 
@@ -612,7 +705,8 @@ func refresh_event_voices(event, fade_sec: float = 0.05) -> void:
 			if old != null and is_instance_valid(old):
 				old.kill()
 		var tw: Tween = p.create_tween()
-		tw.tween_property(p, "volume_db", nb, maxf(0.01, fade_sec))
+		tw.tween_method(func(db: float) -> void: _set_voice_db(p, db),
+			p.volume_db, nb, maxf(0.01, fade_sec))
 		p.set_meta("vol_tw", tw)
 
 
