@@ -2,11 +2,11 @@
 
 **PitchFox Audio Engine** — adaptive music & SFX runtime for Godot 4.x.
 
-It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the addon loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [JavaScript engine](../../../js/README.md); design once, ship on both.
+It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the addon loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [JavaScript engine](https://github.com/pitchfoxaudio/pfa-engine-js); design once, ship on both.
 
 - Addon version **0.11.x** · config schema **v1.1** · pure GDScript, no GDExtension · MIT
 - Requires **Godot 4.x** (developed and tested on 4.6–4.7)
-- Suite overview & version compatibility: [main README](../../../README.md)
+- Part of the **PFA suite** — all components: [github.com/pitchfoxaudio](https://github.com/pitchfoxaudio)
 - Authoring is documented in the **PFA Studio manual**; this README covers the runtime API.
 
 ## Installation
@@ -337,7 +337,7 @@ The JS engine's floors are shorter (10–20 ms) because Web Audio schedules samp
 
 ## Versions & Compatibility
 
-This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon. Full matrix: [main README](../../../README.md#versions--compatibility).
+This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon.
 
 ## License
 

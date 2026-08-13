@@ -2,11 +2,11 @@
 
 **PitchFox Audio Engine** — adaptive music & SFX runtime for Godot 4.x.
 
-It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the addon loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [JavaScript engine](../../../js/README.md); design once, ship on both.
+It plays audio projects authored in **PFA Studio** (the desktop editor): Studio exports a `config.json` + audio files (or a single `.pfabank`), the addon loads and performs them — adaptive music levels, node-graph transitions, randomized SFX, spatial voices, reverb zones. The same export drives the [JavaScript engine](https://github.com/pitchfoxaudio/pfa-engine-js); design once, ship on both.
 
 - Addon version **0.11.x** · config schema **v1.1** · pure GDScript, no GDExtension · MIT
 - Requires **Godot 4.x** (developed and tested on 4.6–4.7)
-- Suite overview & version compatibility: [main README](../../../README.md)
+- Part of the **PFA suite** — all components: [github.com/pitchfoxaudio](https://github.com/pitchfoxaudio)
 - Authoring is documented in the **PFA Studio manual**; this README covers the runtime API.
 
 ## Installation
@@ -108,7 +108,7 @@ Node graph activates when the config has `use_nodes: true`. The engine enters th
 |--------|-------------|
 | `PFA.trigger(event, options := {}) → Array` | Trigger a one-shot SFX. `options` may carry `{"intensity": 0..1}` — per-trigger hit strength (see Intensity). Returns `played` — one Dictionary per track that fired: `{ track, behavior, variation, variation_count, algo, sample }` |
 
-Cooldown (`cooldown_ms`) and voice cap (`max_instances`, oldest voice released) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
+Cooldown (`cooldown_ms`) and voice cap (`max_instances`, least-audible voice released — see Voice management) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
 
 ### Volume & Ducking
 
@@ -214,7 +214,7 @@ A looping event (authored `loop {enabled, mode}` in Studio) keeps sounding until
 
 ### Voice management & stopping
 
-- **`max_instances`** (authored per event, default 8): at the cap the oldest live voice is released through its normal release path — steals are click-free by construction.
+- **`max_instances`** (authored per event, default 8): ONE pool per event — flat `trigger()` voices and spatial voices count together. At the cap the **least audible** voice is stolen (score = per-voice gain incl. intensity × distance attenuation at the listener; equal scores → oldest dies), released through its normal click-free path. A candidate quieter than every live voice is **rejected** — it doesn't start and kills nothing (a rejected trigger also doesn't stamp the cooldown clock). So a full-strength hit is never cut by weak follow-ups, and `max_instances` can be lowered for performance without eating the loudest voices.
 - **Stopping is never a hard cut**: every spatial voice release — `destroy(0.0)`, `stop_all(0.0)`, voice steal — is floored to **30 ms** (`_STOP_FLOOR_SEC`). A loop cut mid-wave is a step discontinuity (an audible click); one-shots simply end and never hit this path.
 - **`release_fade`** (authored per event): the default stop fade wherever no explicit fade is passed. *How* an event ends lives in the editor, not in game code.
 - **`PFA._spatial.clear_all()`** exists for scene teardown: it hard-frees every voice and emitter with **no fade by design** — fade before `change_scene` if you need it silent.
@@ -337,7 +337,7 @@ The JS engine's floors are shorter (10–20 ms) because Web Audio schedules samp
 
 ## Versions & Compatibility
 
-This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon. Full matrix: [main README](../../../README.md#versions--compatibility).
+This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon.
 
 ## License
 
