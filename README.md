@@ -341,7 +341,9 @@ This addon versions independently from the rest of the suite (Studio 0.9.x, JS e
 
 ## License
 
-MIT — free for commercial and personal use.
+**This addon is MIT** — free for commercial and personal use, no attribution required.
+
+It plays packs authored in **PFA Studio**, a separate desktop application with its own license (free to use during the public beta). The pack format is plain JSON — the addon reads a `config.json`, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)
