@@ -1,7 +1,7 @@
 class_name PFALive
 extends Node
 
-## PFA Live Connect — WebSocket bridge to the PFA Editor for real-time tuning.
+## PFA Live Connect — WebSocket bridge to PFA Studio for real-time tuning.
 ## Godot mirror of the web PFALiveConnect (js/src/index.js): same port, same
 ## JSON protocol v1.1. Contract = the editor doc «Live Connect — protocol
 ## audit + roadmap (P2, 2026-06-10)».
@@ -123,7 +123,9 @@ func _send(data: Dictionary) -> void:
 
 
 func _log(msg: String) -> void:
-	print(msg)
+	# Console print rides the global diagnostics gate; the signal always fires so a
+	# game-side status overlay keeps working with debug_logs off.
+	PFAEvent._dlog(msg)
 	log_message.emit(msg)
 
 

@@ -34,6 +34,15 @@ signal transition_info(event_name: String, info: Dictionary)
 
 # --- Config ---
 
+## Verbose runtime diagnostics (node entries, transitions, variation switches,
+## stingers, pack/bank loads). Default OFF: a shipped game prints nothing during
+## normal playback; errors and warnings always come through regardless.
+var debug_logs: bool:
+	set(value):
+		PFAEvent.debug_logs = value
+	get:
+		return PFAEvent.debug_logs
+
 var _config: Dictionary = {}
 var pack_path: String = ""          # last load_pack path — Live Connect's reload re-reads it
 var _events: Dictionary = {}        # event_name -> PFAEvent
@@ -47,7 +56,7 @@ var _reverb: PFAReverb = null           # reverb-zone manager (created when a pa
 
 # --- Public API ---
 
-## Load audio pack from config.json exported by PFA Editor.
+## Load audio pack from config.json exported by PFA Studio.
 func load_pack(config_path: String) -> bool:
 	var file = FileAccess.open(config_path, FileAccess.READ)
 	if file == null:
@@ -92,7 +101,7 @@ func load_pack(config_path: String) -> bool:
 
 	_setup_reverb()
 	_loaded = true
-	print("[PFA] Loaded pack: %s (%d events, %d groups)" % [
+	PFAEvent._dlog("[PFA] Loaded pack: %s (%d events, %d groups)" % [
 		config_path, _events.size(), _groups.size()])
 	return true
 
@@ -133,7 +142,7 @@ func load_bank(bank_path: String) -> bool:
 
 	_setup_reverb()
 	_loaded = true
-	print("[PFA] Loaded bank: %s (%d events, %d groups)" % [
+	PFAEvent._dlog("[PFA] Loaded bank: %s (%d events, %d groups)" % [
 		bank_path, _events.size(), _groups.size()])
 	return true
 
@@ -160,12 +169,10 @@ func navigate(event_name: String, trigger: String) -> bool:
 	var event = _get_event(event_name)
 	if event == null:
 		return false
-	var result = event.navigate(trigger)
-	if result:
-		var node_id = event.get_current_node_id()
-		var node_name = event.get_current_node_name()
-		node_changed.emit(event_name, node_id, node_name)
-	return result
+	# node_changed is emitted from the event's node_applied signal at the moment
+	# the move actually happens — on the bar/beat path that is LATER than this
+	# call, and current_node still holds the old node here.
+	return event.navigate(trigger)
 
 ## Toggle sub-level on/off with optional fade.
 func toggle_sub_level(event_name: String, sub_name: String, enabled: bool, fade: float = 0.5) -> void:
@@ -236,7 +243,10 @@ func crossfade_to(event_name: String, duration: float = 2.0) -> void:
 	if old_event:
 		old_event.fade_out(duration)
 
-	new_event.fade_in(duration)
+	# The explicit duration must own the fresh-start entry ramp: a plain
+	# fade_in() tween would be killed by start_playback()'s own 20 ms
+	# anti-click ramp, leaving the new side at full volume almost instantly.
+	new_event._entry_fade_override = {"duration": duration, "curve": "equal_power"}
 	new_event.start_playback()
 	event_started.emit(event_name)
 
@@ -321,8 +331,9 @@ func set_level(event_name: String, level: int) -> void:
 	if event == null:
 		return
 
+	# level_changed is emitted from the event's level_applied signal at the moment
+	# the switch actually happens (instant now; quantized at the boundary).
 	event.set_level(level)
-	level_changed.emit(event_name, level)
 
 ## Get current level of an event.
 func get_level(event_name: String) -> int:
@@ -553,11 +564,15 @@ func _create_event(event_name: String, data: Dictionary) -> PFAEvent:
 		transition_info.emit(event_name, info)
 	)
 
-	# Auto-advance moves the graph without a navigate() call — bubble it as
-	# node_changed so game-side state mirrors don't go stale (JS parity:
-	# onNodeChanged fires from _executeAutoAdvance too).
-	event.auto_advanced.connect(func(node_id: String, node_name: String):
+	# node_changed / level_changed bubble from the APPLY-point signals, so
+	# subscribers always see the post-change state — never a scheduled move
+	# (navigate/auto/fade_out all funnel through node_applied), and never a
+	# level number the event hasn't reached yet.
+	event.node_applied.connect(func(node_id: String, node_name: String):
 		node_changed.emit(event_name, node_id, node_name)
+	)
+	event.level_applied.connect(func(level: int):
+		level_changed.emit(event_name, level)
 	)
 
 	# Find group volume

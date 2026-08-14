@@ -100,7 +100,7 @@ PFA.release_bank_buffer()    # free the raw bank bytes; audio stays in AudioStre
 | `PFA.get_current_node(event) → String` | Current node ID (`""` if none) |
 | `PFA.toggle_sub_level(event, sub_name, enabled, fade := 0.5)` | Toggle a sub-level layer on/off with a fade |
 
-Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers at transition start, and quantizes per cascade `connection.quantize → node.fade_quantize → event.switchQuantization`.
+Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers at transition start, and quantizes per cascade `connection.quantize → node.fade_quantize → event.switch_quantization`.
 
 ### SFX
 
@@ -129,9 +129,9 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 |--------|-------------|
 | `event_started(event_name)` | Music event started |
 | `event_stopped(event_name)` | Event stopped |
-| `level_changed(event_name, level)` | Adaptive level changed |
+| `level_changed(event_name, level)` | Adaptive level changed — fires when the switch is **applied** (on a `bar`/`beat` quantization that is the boundary, not the `set_level` call) |
 | `sfx_triggered(event_name, played)` | SFX fired — `played` as returned by `trigger()` (empty for spatial one-shots) |
-| `node_changed(event_name, node_id, node_name)` | Active node changed |
+| `node_changed(event_name, node_id, node_name)` | Active node changed — fires at the **apply point** with the new node, for manual `navigate()`, auto-advance and deferred fade-out switches alike |
 | `sub_level_toggled(event_name, sub_name, enabled)` | Sub-level toggled |
 | `transition_info(event_name, info)` | Per-phase transition diagnostics — see Transition Info |
 
@@ -139,6 +139,8 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 PFA.event_started.connect(func(name): print("Started: ", name))
 PFA.transition_info.connect(_on_transition_info)
 ```
+
+**Debug logging**: the addon is silent during normal playback. Set `PFA.debug_logs = true` to print the internal diagnostics (node entries, quantized transitions, variation switches, stingers, pack/bank loads); errors and warnings always come through regardless.
 
 ---
 
@@ -258,9 +260,9 @@ Studio can author named **reverb zones** (room, cave, hall…) at project level 
 
 ---
 
-## Audio Formats (one Godot-specific trap)
+## Audio Formats (what this addon decodes, plus one Godot-specific trap)
 
-OGG is the safe default for everything — Studio exports it out of the box.
+The addon decodes **OGG, MP3 and WAV** — as loose exported files and inside a `.pfabank`. Studio's export dialog also offers OPUS / AAC / FLAC / AIFF for web and other targets; Godot 4 has no runtime decoder for those, so for a Godot project export (or at least first-in-list) one of OGG / MP3 / WAV. OGG is the safe default for everything — Studio exports it out of the box.
 
 **Don't ship seamless-looping WAVs on Godot**: native WAV looping has a one-frame overread bug ([godotengine/godot#119778](https://github.com/godotengine/godot/issues/119778)) that clicks at the loop seam no matter how clean the file is. The engine's loops are safe as exported (OGG); Studio's **"SFX → WAV"** export toggle is for **one-shot** latency (WAV decodes cheapest) and deliberately leaves looping SFX in OGG. If you hand-convert files, keep that rule.
 
@@ -337,7 +339,7 @@ The JS engine's floors are shorter (10–20 ms) because Web Audio schedules samp
 
 ## Versions & Compatibility
 
-This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon.
+This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon, provided the export uses an audio format the addon decodes (OGG / MP3 / WAV — see Audio Formats).
 
 ## License
 

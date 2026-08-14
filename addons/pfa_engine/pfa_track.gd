@@ -11,7 +11,7 @@ extends RefCounted
 var name: String = ""
 var volume: float = 1.0
 var level_behavior: String = "level_specific"          # "level_specific" | "always_play" | "level_conditional"
-var randomization: Dictionary = {}                      # SFX randomization: { pitch, volume, delay, pan, rate }
+var randomization: Dictionary = {}                      # SFX randomization: { pitch, volume, delay, rate } consumed; a config's `pan` block is carried but not applied (no per-voice pan on a flat AudioStreamPlayer)
 var repeat_count: int = 1                               # repeats of loop_bars before variation check
 var chance_reroll_bars: int = 1                         # play_chance reroll interval multiplier
 var randomization_algo: String = "random"               # "random" | "weighted" | "no_repeat"

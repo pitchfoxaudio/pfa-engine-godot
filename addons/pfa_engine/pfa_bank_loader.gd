@@ -59,7 +59,7 @@ func load_bank(path: String) -> bool:
 	var section_entry_size = view.get_u32()
 	var file_size = view.get_u64()
 
-	print("[PFA Bank] v%d.%d, %d sections, %d bytes" % [ver_major, ver_minor, section_count, file_size])
+	PFAEvent._dlog("[PFA Bank] v%d.%d, %d sections, %d bytes" % [ver_major, ver_minor, section_count, file_size])
 
 	# Parse section directory
 	var json_offset: int = 0
@@ -109,7 +109,7 @@ func load_bank(path: String) -> bool:
 	audio_entries = config.get("_audio_entries", {})
 	config.erase("_audio_entries")
 
-	print("[PFA Bank] Loaded: %d events, %d audio entries" % [
+	PFAEvent._dlog("[PFA Bank] Loaded: %d events, %d audio entries" % [
 		config.get("events", {}).size(), audio_entries.size()])
 	return true
 
@@ -167,7 +167,7 @@ func get_audio_stream(rel_path: String) -> AudioStream:
 ## Release raw bank data (audio entries already sliced or streamed).
 func release_bank_buffer() -> void:
 	_bank_data = PackedByteArray()
-	print("[PFA Bank] Bank buffer released")
+	PFAEvent._dlog("[PFA Bank] Bank buffer released")
 
 
 ## Get base directory from config (empty for bank mode).

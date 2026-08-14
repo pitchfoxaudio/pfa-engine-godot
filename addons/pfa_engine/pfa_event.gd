@@ -8,9 +8,30 @@ extends Node
 signal transition_info(info: Dictionary)
 
 ## Fired when the node graph moves WITHOUT a navigate() call (auto-advance).
-## Bubbled by the PFA autoload as `node_changed` — JS parity: web fires
-## onNodeChanged from _executeAutoAdvance "same as navigate()".
+## Emitted at the APPLY point (after the node actually changed), so subscribers
+## never see a scheduled-but-not-yet-applied move.
 signal auto_advanced(node_id: String, node_name: String)
+
+## Fired when a node transition has ACTUALLY been applied (current_node changed) —
+## instant navigate, quantized timer apply, deferred fade_out switch and auto-advance
+## all funnel through here. Bubbled by the PFA autoload as `node_changed`. A wrapper
+## must not synthesize this synchronously: on the bar/beat path the move happens later.
+signal node_applied(node_id: String, node_name: String)
+
+## Fired when a level change has ACTUALLY been applied (current_level changed) —
+## instant path, quantized timer apply, and the not-playing direct set. Bubbled by
+## the PFA autoload as `level_changed`.
+signal level_applied(level: int)
+
+## Verbose runtime diagnostics gate (node entries, transitions, variation switches,
+## stingers, bank loads). Default OFF — a released game stays silent; errors and
+## warnings always go through push_warning/push_error regardless. Toggle via
+## `PFA.debug_logs = true` (autoload property mirrors this static).
+static var debug_logs: bool = false
+
+static func _dlog(msg: String) -> void:
+	if debug_logs:
+		print(msg)
 
 ## Runtime event — manages playback of tracks for one music/sfx event.
 ## Faithful port of JS PFAEvent (pfa-engine/js/src/index.js L1257-2351).
@@ -41,6 +62,12 @@ var switch_quantization: String = "instant"  # "instant" | "bar" | "beat"
 # duration 0 = no musical fade (engine keeps its _MICRO_FADE_SEC 30ms anti-click floor).
 var start_fade: Dictionary = {"duration": 0.0, "curve": "equal_power"}
 var release_fade: Dictionary = {"duration": 0.0, "curve": "equal_power"}
+# One-shot entry-fade override for the NEXT fresh start — set by PFA.crossfade_to()
+# so the caller's explicit duration owns the fresh-start ramp instead of the 20 ms
+# anti-click default (which _tween_event_gain would otherwise floor to 30 ms,
+# killing the crossfade's in-ramp). Consumed (and cleared) by start_playback();
+# beats node entry_fade and event start_fade — an explicit API duration wins.
+var _entry_fade_override: Dictionary = {}
 # Per-event SPATIAL attenuation authored in the editor (config.json `spatial` block,
 # snake_case). Read by the spatial path (PFASpatial) as the DEFAULT spatial "how"; a
 # game-passed config still overrides. Empty/disabled ⇒ engine falls back to its spatial
@@ -230,6 +257,11 @@ func start_playback() -> void:
 	var was_already_playing: bool = is_playing
 	is_playing = true
 
+	# Consume the one-shot crossfade_to override up front: a re-press of Play must
+	# not inherit a stale override from an earlier crossfade_to call.
+	var entry_override: Dictionary = _entry_fade_override
+	_entry_fade_override = {}
+
 	var entry_node_id: String = ""
 	if use_nodes and not _node_graph_data.is_empty():
 		entry_node_id = _node_graph_data.get("entry_node", "")
@@ -251,7 +283,7 @@ func start_playback() -> void:
 				node_owns_entry = true
 				entry_fade_dur = float(ef.get("fade_duration", 0.02))
 				entry_fade_curve = str(ef.get("fade_curve", "equal_power"))
-				print("[PFA] Entry fade-in: %.2fs (%s)" % [entry_fade_dur, entry_fade_curve])
+				_dlog("[PFA] Entry fade-in: %.2fs (%s)" % [entry_fade_dur, entry_fade_curve])
 				transition_info.emit({
 					"phase": "entry_fade",
 					"duration": entry_fade_dur,
@@ -264,12 +296,18 @@ func start_playback() -> void:
 		if not node_owns_entry and float(start_fade.get("duration", 0.0)) > 0.0:
 			entry_fade_dur = float(start_fade.get("duration", 0.0))
 			entry_fade_curve = str(start_fade.get("curve", "equal_power"))
-			print("[PFA] Start fade-in: %.2fs (%s)" % [entry_fade_dur, entry_fade_curve])
+			_dlog("[PFA] Start fade-in: %.2fs (%s)" % [entry_fade_dur, entry_fade_curve])
 			transition_info.emit({
 				"phase": "start_fade",
 				"duration": entry_fade_dur,
 				"curve": entry_fade_curve,
 			})
+		# crossfade_to's explicit duration owns the fresh-start ramp — it must win
+		# over node/event entry fades, or the anti-click default swallows the caller's
+		# requested in-ramp.
+		if not entry_override.is_empty():
+			entry_fade_dur = float(entry_override.get("duration", 0.02))
+			entry_fade_curve = str(entry_override.get("curve", "equal_power"))
 		_set_event_gain_amp(0.0001)
 		# _effective_event_amp(): a fresh start of a live-ducked event settles at
 		# the duck level, not full (duck state survives stop()/start).
@@ -432,8 +470,10 @@ func set_level(level: int) -> void:
 			var old_level: int = current_level
 			current_level = level
 			_crossfade_level(old_level, level)
+			level_applied.emit(level)
 	else:
 		current_level = level
+		level_applied.emit(level)
 
 ## Navigate node graph via trigger. Returns true if transition matched. JS: navigate()
 func navigate(trigger: String) -> bool:
@@ -531,7 +571,7 @@ func stop_with_terminal_fade() -> bool:
 		return false
 	var dur: float = float(tf.get("fade_duration", 2.0))
 	var curve: String = str(tf.get("fade_curve", "equal_power"))
-	print("[PFA] Terminal fade-out: %.2fs (%s, node=%s)" % [dur, curve, current_node])
+	_dlog("[PFA] Terminal fade-out: %.2fs (%s, node=%s)" % [dur, curve, current_node])
 	transition_info.emit({
 		"phase": "terminal_fade",
 		"duration": dur,
@@ -645,7 +685,7 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 		_stop_all_sub_levels_immediate()
 		_sync_bar_duration_to_current_node()
 		_schedule_auto_advance(node)
-		print("[PFA] Entered node \"%s\" (%s), level=%d" % [node.get("name", ""), node_id, target_level])
+		_dlog("[PFA] Entered node \"%s\" (%s), level=%d" % [node.get("name", ""), node_id, target_level])
 	else:
 		# Node transition — check quantization.
 		var boundary: float = _get_quantized_time(quantize)
@@ -792,7 +832,7 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 	)
 
 	var chain_suffix: String = (" + fade in %.2fs (%s)" % [entry_fd, entry_curve]) if entry_fd > 0.0 else ""
-	print("[PFA] Fade Out \"%s\" → \"%s\" over %.2fs (%s)%s" % [
+	_dlog("[PFA] Fade Out \"%s\" → \"%s\" over %.2fs (%s)%s" % [
 		from_node_id, node.get("name", ""), fd, exit_curve, chain_suffix])
 	transition_info.emit({
 		"phase": "fade_out_start",
@@ -826,7 +866,7 @@ func _post_transition_common(node_id: String, node: Dictionary, target_level: in
 
 	var from_name: String = _resolve_node_name(from_node_id)
 	var direction: String = str(fade_settings.get("fade_direction", "both"))
-	print("[PFA] Entered node \"%s\" (%s), level=%d, bar_dur=%.3fs, kind=%s, dir=%s, fd=%.2fs, from=\"%s\"" % [
+	_dlog("[PFA] Entered node \"%s\" (%s), level=%d, bar_dur=%.3fs, kind=%s, dir=%s, fd=%.2fs, from=\"%s\"" % [
 		node.get("name", ""), node_id, target_level, _bar_duration_sec, kind_label, direction, fd, from_name])
 	transition_info.emit({
 		"phase": "transition",
@@ -840,6 +880,12 @@ func _post_transition_common(node_id: String, node: Dictionary, target_level: in
 		"to_name": str(node.get("name", node_id)),
 		"level": target_level,
 	})
+	# The node change is now REAL (current_node was assigned by the kind helper /
+	# fade_out timer above) — this is the only place the applied signals may fire.
+	var applied_name: String = str(node.get("name", node_id))
+	node_applied.emit(node_id, applied_name)
+	if bool(fade_settings.get("auto", false)):
+		auto_advanced.emit(node_id, applied_name)
 
 ## Look up a node's display name from the graph (falls back to id / "start" sentinel
 ## when the from-node is empty — first entry from play() has no predecessor).
@@ -873,7 +919,7 @@ func _schedule_node_transition(node_id: String, node: Dictionary, target_level: 
 		ev._pending_node_transition = null
 		if not ev.is_playing: return
 		ev._apply_node_transition(captured_id, captured_node, captured_level, captured_fd, captured_fc, captured_fs)
-		print("[PFA] Quantized node transition applied")
+		_dlog("[PFA] Quantized node transition applied")
 	)
 
 ## JS: _executeTransition(connection)
@@ -885,6 +931,7 @@ func _execute_transition(connection: Dictionary) -> void:
 		"stinger": connection.get("stinger", null),
 		"kind": connection.get("kind", "crossfade"),
 		"fade_direction": connection.get("fade_direction", "both"),
+		"auto": connection.get("auto", false),
 	}
 	if connection.has("entry_fade_duration"):
 		fs["entry_fade_duration"] = connection["entry_fade_duration"]
@@ -934,7 +981,7 @@ func _schedule_auto_advance(node: Dictionary) -> void:
 	if duration <= 0.0:
 		return
 
-	print("[PFA] Auto-advance in %.3fs (node=%s, loop_count=%d, free=%s, terminal=%s)" % [
+	_dlog("[PFA] Auto-advance in %.3fs (node=%s, loop_count=%d, free=%s, terminal=%s)" % [
 		duration, current_node, loop_count, str(free_tempo), str(has_terminal and not has_auto)])
 
 	var aa_timer: SceneTreeTimer = get_tree().create_timer(duration)
@@ -975,19 +1022,17 @@ func _execute_auto_advance() -> void:
 				and c.get("auto", false):
 			candidates.append(c)
 	if candidates.is_empty():
-		print("[PFA] No auto-advance from \"%s\"" % current_node)
+		_dlog("[PFA] No auto-advance from \"%s\"" % current_node)
 		return
 	candidates.sort_custom(func(a, b): return int(b.get("priority", 0)) - int(a.get("priority", 0)) > 0)
 	for conn in candidates:
 		var prob: float = float(conn.get("probability", 100))
 		if randf() * 100.0 <= prob:
-			print("[PFA] Auto-advance \"%s\" → \"%s\"" % [current_node, conn.get("target", "")])
+			_dlog("[PFA] Auto-advance \"%s\" → \"%s\"" % [current_node, conn.get("target", "")])
+			# auto_advanced / node_applied fire from _post_transition_common at the
+			# APPLY point (the connection carries auto:true) — emitting here would
+			# report the OLD node on the quantized/fade_out paths.
 			_execute_transition(conn)
-			# JS parity (index.js _executeAutoAdvance): node_changed fires on
-			# auto-advance too, not only on navigate() — games mirroring the
-			# graph state (fox-run cave HUD) went stale without it.
-			if not current_node.is_empty():
-				auto_advanced.emit(current_node, get_current_node_name())
 			return
 
 
@@ -1445,7 +1490,7 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 			"curve": fade_curve,
 		}
 		_track_level_state[track.name] = lvl_state_map
-		print("[PFA] Variation switch: %s L%d: %d → %d (live fade handed over, %.2fs left)"
+		_dlog("[PFA] Variation switch: %s L%d: %d → %d (live fade handed over, %.2fs left)"
 				% [track.name, level, old_variation, new_variation, fade_end - now])
 		return
 
@@ -1472,7 +1517,7 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 		"curve": "equal_power",
 	}
 	_track_level_state[track.name] = lvl_state_map
-	print("[PFA] Variation switch: %s L%d: %d → %d" % [track.name, level, old_variation, new_variation])
+	_dlog("[PFA] Variation switch: %s L%d: %d → %d" % [track.name, level, old_variation, new_variation])
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1806,7 +1851,8 @@ func _schedule_level_switch(level: int, when_time: float) -> void:
 		var old_level: int = ev.current_level
 		ev.current_level = captured_level
 		ev._crossfade_level(old_level, captured_level)
-		print("[PFA] Quantized setLevel: %d → %d" % [old_level, captured_level])
+		_dlog("[PFA] Quantized setLevel: %d → %d" % [old_level, captured_level])
+		ev.level_applied.emit(captured_level)
 	)
 
 
@@ -1996,7 +2042,7 @@ func _play_stinger(connection_key: String) -> void:
 	player.finished.connect(func():
 		if is_instance_valid(player): player.queue_free()
 	)
-	print("[PFA] Stinger fired (key=%s, idx=%d, mode=%s, vol=%.2f)" % [connection_key, idx, str(bundle.get("mode", "")), final_amp])
+	_dlog("[PFA] Stinger fired (key=%s, idx=%d, mode=%s, vol=%.2f)" % [connection_key, idx, str(bundle.get("mode", "")), final_amp])
 
 ## Variant selection algorithm. Canonical mirror of core/stinger_picker.py.
 ## Modes: "random" | "weighted" | "no_repeat" (unknown → random).
@@ -2101,7 +2147,12 @@ func _check_can_trigger(candidate_amp: float = 1.0, candidate_dist: float = 1.0,
 				float(p.get_meta("pre_amp", 1.0)),
 				"spawn_us": int(p.get_meta("spawn_us", 0)), "i": live.size(),
 				"player": p, "spatial": true})
-		var needed: int = mini(live.size() + spawn_count - cap, live.size())
+		var needed: int = live.size() + spawn_count - cap
+		if needed > live.size():
+			# The trigger's own spawn exceeds the cap even if every live voice dies —
+			# admit nothing rather than blow past the authored polyphony ceiling
+			# (a multi-track hit is atomic; partial admission would change its timbre).
+			return false
 		if needed > 0:
 			live.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 				if a["score"] != b["score"]:
