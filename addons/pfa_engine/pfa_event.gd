@@ -133,8 +133,8 @@ var _pending_level_switch: SceneTreeTimer = null
 var _pending_node_transition: SceneTreeTimer = null
 var _fade_out_timer: SceneTreeTimer = null
 # Transition Kinds v2: fade_out → timer for deferred instant-switch to target
-# after OLD finishes fading. Editor analogue: _pending_deferred_navigate in
-# core/music_event.py:84. Gates auto-advance during the exit fade window.
+# after OLD finishes fading. Editor analogue: its deferred navigate.
+# Gates auto-advance during the exit fade window.
 var _pending_fade_out_switch: SceneTreeTimer = null
 
 # Generation token guarding stop_playback()'s deferred player teardown against a
@@ -180,7 +180,7 @@ var _samples_loaded: bool = false
 var _play_start_time: float = 0.0
 ## −∞ epoch, NOT 0.0: ticks start at process launch, so a 0.0 init silently muted
 ## any event whose cooldown_ms exceeded the game's uptime at first trigger
-## (uptime − 0 < cooldown). Found by the voice-stealing red suite.
+## (uptime − 0 < cooldown). Found when a first trigger landed inside cooldown.
 var _last_trigger_time_ms: float = -1.0e12
 var _active_sfx_count: int = 0
 
@@ -235,7 +235,7 @@ var _level_phase_anchors: Dictionary = {}
 ## schedule can fire AFTER navigate() has moved current_level to a different
 ## level. Without the gen check, an "unmute" chance_gain ramp for the OLD level
 ## raises it back to full volume on top of the NEW level (audible "ghost"
-## track). Editor (core/multisample.py) avoids this by using per-tick state
+## track). The editor avoids this by using per-tick state
 ## evaluation with no scheduled callbacks — a deeper refactor we defer.
 var _transition_gen: int = 0
 
@@ -723,9 +723,13 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 ##   "fade_in"              — OLD hard-cut (anti-click floor), NEW fades 0→vol over fd.
 ##   "fade_out"             — OLD fades vol→0 over fd; at fade_end instant-switch to target.
 ##
-## Not yet supported (needs exporter changes to emit terminal/chain metadata, see
-## master plan): terminal fade_out (no outgoing edge in editor) and fade_out→fade_in
-## chain. Those fall back to hard-switch semantics for now.
+## Two shapes reach this from the exporter rather than from a plain connection:
+##   terminal fade_out — a Fade Out with no outgoing transition. It is the
+##     event's authored ending, scheduled and dispatched below (see the
+##     terminal_fade handling in the auto-advance path), not a hard switch.
+##   fade_out → fade_in chain — flattened by the exporter into ONE connection
+##     carrying `entry_fade_duration` / `entry_fade_curve`; the new level ramps
+##     up from 0 after the switch instead of hard-cutting.
 func _apply_node_transition(node_id: String, node: Dictionary, target_level: int,
 		fd: float, fc: String, fade_settings: Dictionary) -> void:
 	# Any in-flight fade_out deferred switch is superseded by this new transition.
@@ -735,7 +739,7 @@ func _apply_node_transition(node_id: String, node: Dictionary, target_level: int
 	# Invalidate any pending per-level scheduled timers (variation swap, chance gain)
 	# that were captured under the pre-transition state. Without this, an OLD-level
 	# chance_gain timer firing after navigate would re-raise OLD level volume to 1.0
-	# on top of the NEW level (observed leak: fx_voce from L2 audible on L1 after
+	# on top of the NEW level (observed leak: an L2 layer audible on L1 after
 	# 4s crossfade completes). See _transition_gen docs at top of file.
 	_transition_gen += 1
 
@@ -767,7 +771,7 @@ func _apply_transition_crossfade(node_id: String, node: Dictionary, target_level
 	_post_transition_common(node_id, node, target_level, fade_settings, "crossfade", fd, from_node_id)
 
 ## Fade In: OLD hard-stops (anti-click floor absorbs the cut), NEW ramps 0→volume over fd.
-## Editor reference: core/music_event.py calls track.start_entry_fade on the NEW tracks
+## Editor reference: it calls start_entry_fade on the NEW tracks
 ## and _set_exit_for_level(skip_tail=True) on the OLD level. In Godot's per-level model
 ## we get the same shape by silencing all non-target levels instantly (with anti-click)
 ## and giving the target level the long ramp.
@@ -1122,7 +1126,7 @@ func _calc_next_beat_boundary() -> float:
 
 ## JS: _getQuantizedTime(quantize) — returns -1 (=null in JS) for instant.
 ## Editor Phase 1.5 parity: if current node has free_tempo, force instant —
-## there's no bar/beat grid to snap to (editor: core/music_event.py:404-408 in
+## there's no bar/beat grid to snap to (the editor does the same in
 ## _compute_scheduled_switch_position). Covers level switches, node transitions,
 ## and connection-level quantize overrides since they all route through here.
 func _get_quantized_time(quantize: String) -> float:
@@ -1193,7 +1197,7 @@ func _stop_conductor() -> void:
 ## JS: _initialPlayChanceRoll()
 ## Fabric model: EVERY level of a level_specific track gets its own verdict +
 ## reroll grid at start. Background levels keep rolling while inactive (editor
-## reference: core/region.py _advance_level_state simulates exactly this), so
+## reference: the editor's _advance_level_state simulates exactly this), so
 ## entering a level at any moment catches its live chance texture.
 func _initial_play_chance_roll() -> void:
 	_track_chance_state.clear()
@@ -1432,7 +1436,7 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 	# bookkeeping on a muted lane. The editor's freeze survives only in its original
 	# narrow sense ("OLD level during crossfade must not swap variation at loop
 	# boundary — counters still advance but the swap itself is vetoed",
-	# core/multisample.py:475-479): while the OUTGOING lane is still audibly fading,
+	# the editor vetoes it the same way): while the OUTGOING lane is still audibly fading,
 	# swapping would kill the fade tween mid-ramp and click. Checked BEFORE the pick
 	# so a vetoed boundary never consumes the rotation bag.
 	var background: bool = (not is_shared) and level != current_level
@@ -1669,8 +1673,8 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 	# (~16.7ms @ 60fps), so any fade shorter than ~2 frames renders as a step change →
 	# audible click. Two cases handled here:
 	#   (1) dur=0 ("instant" level change): JS/editor rely on sample-accurate ramps;
-	#       Godot needs 30ms to span 2 frames. Matches editor's 10ms _anticlick_samples
-	#       (core/track.py:102,389) scaled for Godot's frame limit.
+	#       Godot needs 30ms to span 2 frames. Matches the editor's 10ms anti-click
+	#       window, scaled for Godot's frame limit.
 	#   (2) dur small but non-zero (e.g. chance_fade_mode="instant" passes 0.01s, JS
 	#       L2030): same physical constraint applies. Floor to _MICRO_FADE_SEC.
 	# If the amp isn't actually changing, keep truly instant — no click to prevent.
@@ -1699,7 +1703,7 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 	_track_level_state[track.name] = lvl_state_map
 
 ## Fade-in curve shape 0→1 for given progress ∈ [0,1]. Editor parity:
-## core/track.py::_get_fade_value. Callers use f(1-p) for fade-out semantics
+## the editor's _get_fade_value. Callers use f(1-p) for fade-out semantics
 ## (so equal_power yields sin→cos decay as before; exp/log stay complementary).
 func _eval_fade_in_curve(progress: float, curve: String) -> float:
 	progress = clampf(progress, 0.0, 1.0)
@@ -1831,7 +1835,7 @@ func _crossfade_level(old_level: int, new_level: int) -> void:
 ## The phase anchor replaces _play_start_time for this level in _calc_next_loop_boundary,
 ## so the first post-restart boundary lands at `anchor + loop_duration` (not somewhere
 ## inside the restarted loop). Editor equivalent: _apply_restart_on_entry's
-## `state._switch_position = current_position` (core/music_event.py:608).
+## `state._switch_position = current_position`.
 func _restart_all_players_of_level(level: int) -> void:
 	_level_phase_anchors[level] = _now()
 	for track in tracks:
@@ -2067,7 +2071,7 @@ func _play_stinger(connection_key: String) -> void:
 	)
 	_dlog("[PFA] Stinger fired (key=%s, idx=%d, mode=%s, vol=%.2f)" % [connection_key, idx, str(bundle.get("mode", "")), final_amp])
 
-## Variant selection algorithm. Canonical mirror of core/stinger_picker.py.
+## Variant selection algorithm. Canonical mirror of the editor's picker.
 ## Modes: "random" | "weighted" | "no_repeat" (unknown → random).
 ## Mutates bundle.state.last_idx (used by no_repeat).
 func _pick_stinger_variant(bundle: Dictionary) -> int:
@@ -2581,7 +2585,7 @@ func _now() -> float:
 ## Set loop flags per-format (JS: loopStart/loopEnd = the CLIP window on the source).
 ## WAV expresses the clip window natively (loop points are frames). OGG/MP3 have no
 ## loop-END property — the stream wraps at its natural FILE end, which is NOT the clip
-## boundary when the file carries encoder padding (china bass: +2048 samples = +42.7ms
+## boundary when the file carries encoder padding (measured: +2048 samples = +42.7ms
 ## of drift per wrap vs the sample-exact drums) or an authored region. For those,
 ## _maybe_drive_clip_wrap() drives the wrap manually.
 func _setup_loop(stream: AudioStream, clip: PFARegionClip = null) -> void:
@@ -2632,13 +2636,13 @@ static func _prepare_loop_stream(stream: AudioStream, clip: PFARegionClip) -> Au
 
 ## OGG/MP3 cannot express a loop END, so when a looping music clip's window is
 ## shorter than its file the stream wraps LATE every cycle and nothing ever
-## resyncs (china bass: +2048 padding samples = +42.7ms/wrap drift against the
+## resyncs (measured: +2048 padding samples = +42.7ms/wrap drift against the
 ## sample-exact 8s drums; web is immune via loopEnd = offset + sourcePlayLength).
 ## Drive the wrap manually: a timer chain on the SAME wall-clock grid the
 ## conductor's boundary math uses (_play_start_time domain) re-seeks the voice to
 ## the grid-true position each clip cycle. Error per wrap = timer lateness
 ## (≤ ~1 frame, plays a sliver of padding at the seam) and does NOT accumulate —
-## every seek re-locks phase to the grid. Sample-exact files (cave, advanced_music)
+## every seek re-locks phase to the grid. Sample-exact files
 ## never enter here: the natural stream wrap already IS the clip window.
 func _maybe_drive_clip_wrap(player: AudioStreamPlayer, stream: AudioStream, clip: PFARegionClip,
 		start_phase: float = 0.0) -> void:

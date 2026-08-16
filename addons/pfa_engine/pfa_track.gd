@@ -38,11 +38,11 @@ var _samples_loaded: bool = false
 var _bank_loader: PFABankLoader = null
 
 # Per-pool variation rotation state, keyed "shared" or str(level) — editor parity:
-# LevelState.current_variation_index + _variation_shuffle_bag (core/multisample.py:43-68),
+# LevelState.current_variation_index + _variation_shuffle_bag in the editor,
 # each level rotates its own variations independently. Pools of different sizes must
 # never share one index/bag: a no_repeat bag minted on a 5-variation level pops
 # out-of-range indices on a 2-variation level → the swap bails → variation sticks
-# for a full extra loop per stale entry (china L2 first-entry bug).
+# for a full extra loop per stale entry (observed on first entry to a level).
 var _variation_state: Dictionary = {}                   # level_key -> {"current": int, "bag": Array}
 
 # play_chance_mode state (JS: _chanceConsecutivePlays/_chanceConsecutiveSilences/_chanceShuffleBags).
@@ -133,7 +133,7 @@ func get_stream(level: int) -> AudioStream:
 ##
 ## Selects the shared pool for always_play / level_conditional, else the per-level pool.
 ## When `pick_variation` is true and there is more than one variation, rolls switch_chance
-## (editor parity: core/sfx_event.py trigger() rolls switch_chance, then picks a variation;
+## (editor parity: its trigger() rolls switch_chance, then picks a variation;
 ## always_play has no level data → switch_chance defaults to 100 → re-pick every trigger).
 ## Music leaves _current_variation to the Conductor — it passes pick_variation = false.
 ## Returns {} when no stream is available, else

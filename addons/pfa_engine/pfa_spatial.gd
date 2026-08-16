@@ -40,8 +40,8 @@ const _CFG_KEYS := ["mode", "model", "min_distance", "max_distance", "rolloff", 
 const _SILENCE_DB := -80.0          # Godot's effective silence floor; fade targets land here
 const _SMART_CROSS := 0.08          # 80 ms crossfade seam on a smart re-loop (JS parity)
 # Anti-click floor for voice release. volume_db moves per-FRAME (tween), so a sub-2-frame
-# ramp collapses to a step = audible click when a LOOP is cut mid-wave (web-billiards
-# ball_roll stop repro); one-shots end at a natural zero and never hit this.
+# ramp collapses to a step = audible click when a LOOP is cut mid-wave (observed on a rolling-ball
+# loop stopped mid-roll); one-shots end at a natural zero and never hit this.
 # 0.030 = pfa_event._MICRO_FADE_SEC: ~2 frames @ 60 fps. Applies to EVERY
 # release path — destroy(0) / stop_all_voices(0) / max_instances steal; clear_all()
 # alone stays a hard teardown by design (scene-change bulk free).
@@ -374,7 +374,7 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 	# A windowed one-shot is freed by its stop timer ALONE (the finished handler below skips
 	# it). Otherwise a natural stream-end frees the player first, and the stop timer's captured
 	# `player` reference is then a freed instance → "lambda capture was freed" error each time
-	# a trimmed spatial one-shot ends (surfaced by the 2D fox-run hedgehog footsteps/breath).
+	# a trimmed spatial one-shot ends (surfaced by 2D footstep and breath one-shots).
 	# Both lifecycle timers are Timer CHILDREN of the player (not tree-scoped
 	# SceneTreeTimers): a child dies WITH the player, so an early free (emitter.destroy /
 	# stop_all_voices / release mid-delay or mid-window) can never leave an orphan timeout

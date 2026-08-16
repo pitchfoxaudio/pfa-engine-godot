@@ -3,8 +3,7 @@ extends Node
 
 ## PFA Live Connect — WebSocket bridge to PFA Studio for real-time tuning.
 ## Godot mirror of the web PFALiveConnect: same port, same
-## JSON protocol v1.1. Contract = the editor doc «Live Connect — protocol
-## audit + roadmap (P2, 2026-06-10)».
+## JSON protocol v1.1.
 ##
 ## Usage in a game scene:
 ##   var live := PFALive.new()
@@ -25,7 +24,7 @@ signal log_message(msg: String)
 ## ambiences / music here (stop_all killed the voices; emitters survived).
 signal pack_reloaded
 
-const ENGINE_VERSION := "0.11.0"
+const ENGINE_VERSION := "0.11.2"
 const DEFAULT_PORT := 9264
 const RECONNECT_DELAY := 5.0       # JS parity: fixed 5 s retry
 const RELOAD_SETTLE := 0.6         # JS parity: lets stop_all's 0.5 s fade ring out
