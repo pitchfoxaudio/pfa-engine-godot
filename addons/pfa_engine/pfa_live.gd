@@ -2,7 +2,7 @@ class_name PFALive
 extends Node
 
 ## PFA Live Connect — WebSocket bridge to PFA Studio for real-time tuning.
-## Godot mirror of the web PFALiveConnect (js/src/index.js): same port, same
+## Godot mirror of the web PFALiveConnect: same port, same
 ## JSON protocol v1.1. Contract = the editor doc «Live Connect — protocol
 ## audit + roadmap (P2, 2026-06-10)».
 ##
@@ -130,8 +130,7 @@ func _log(msg: String) -> void:
 
 
 ## Dispatch an editor message onto the engine API — exact mirror of the JS
-## client's switch (test-live-connect.js locks the JS side; test_live_client.gd
-## locks this one).
+## client's switch; both engines' clients are locked by their own tests.
 func _handle_message(msg: Dictionary) -> void:
 	if pfa == null:
 		return
@@ -198,7 +197,12 @@ func _reload_pack() -> void:
 	_log("[PFA Live] Reloading audio pack...")
 	pfa.stop_all(0.5)
 	await get_tree().create_timer(RELOAD_SETTLE).timeout
-	pfa.load_pack(path)
+	# A refused reload (Studio mid-write, wrong path) leaves the running pack
+	# loaded — say so instead of announcing a reload that did not happen.
+	if not pfa.load_pack(path):
+		_reloading = false
+		_log("[PFA Live] Reload refused — keeping the loaded pack")
+		return
 	_reloading = false
 	_log("[PFA Live] Audio pack reloaded")
 	pack_reloaded.emit()

@@ -41,8 +41,8 @@ const _SILENCE_DB := -80.0          # Godot's effective silence floor; fade targ
 const _SMART_CROSS := 0.08          # 80 ms crossfade seam on a smart re-loop (JS parity)
 # Anti-click floor for voice release. volume_db moves per-FRAME (tween), so a sub-2-frame
 # ramp collapses to a step = audible click when a LOOP is cut mid-wave (web-billiards
-# ball_roll stop repro, sess28); one-shots end at a natural zero and never hit this.
-# 0.030 = pfa_event._MICRO_FADE_SEC (a5a350b): ~2 frames @ 60 fps. Applies to EVERY
+# ball_roll stop repro); one-shots end at a natural zero and never hit this.
+# 0.030 = pfa_event._MICRO_FADE_SEC: ~2 frames @ 60 fps. Applies to EVERY
 # release path — destroy(0) / stop_all_voices(0) / max_instances steal; clear_all()
 # alone stays a hard teardown by design (scene-change bulk free).
 const _STOP_FLOOR_SEC := 0.030
@@ -168,7 +168,7 @@ func _trigger_on_emitter(emitter: PFASpatialEmitter, event_name: String) -> Obje
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ── Audibility scoring (voice stealing, sess122) ──────────────────────
+# ── Audibility scoring (voice stealing) ──────────────────────
 # ══════════════════════════════════════════════════════════════════════
 #
 # The cap itself lives in PFAEvent._check_can_trigger — ONE pool per event, flat +

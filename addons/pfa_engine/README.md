@@ -13,8 +13,24 @@ It plays audio projects authored in **PFA Studio** (the desktop editor): Studio 
 
 1. Copy `addons/pfa_engine/` into your Godot project's `addons/` folder
 2. Enable the plugin: Project → Project Settings → Plugins → **PFA Engine** → Enable
-3. The plugin registers **`PFA`** as an autoload singleton — use it directly from any script
-4. Put your exported audio pack anywhere the game can read (`res://audio/`, or next to the project for shared exports)
+3. The plugin registers **`PFA`** as an autoload singleton — use it directly from any script, and makes sure `.pfabank` files reach your exported build
+4. Put your exported audio pack in the project (`res://audio/`), or load it from `user://` — see [Exporting Your Game](#exporting-your-game) before you place it anywhere else
+
+### Updating
+
+Extract the new `addons/pfa_engine/` over the old one and reopen the project. Nothing else is needed: no release of this addon has ever removed a file, so there is nothing stale to clean up, and the `PFA` autoload entry keeps working across versions.
+
+### Removing
+
+**Disable the plugin before you delete the folder** — Project → Project Settings → Plugins → **PFA Engine** → uncheck. That is what removes the `PFA` autoload from `project.godot`.
+
+Deleting `addons/pfa_engine/` while the plugin is still enabled leaves the `PFA` autoload entry behind in `project.godot`, and every run of the project then prints:
+
+```
+ERROR: Failed to instantiate an autoload, can't load from path: res://addons/pfa_engine/pfa.gd
+```
+
+The project still runs, and the fix is one step: Project → Project Settings → **Autoload** → select `PFA` → Remove.
 
 ## Quick Start
 
@@ -38,11 +54,13 @@ func _on_ball_hit(pos: Vector3, speed: float):
                            {"intensity": clampf(speed / 5.0, 0.0, 1.0)})
 ```
 
-Event names come from your Studio project (lowercase, `_` for spaces); `PFA.get_event_names()` lists everything the pack loaded.
+Event names come from your Studio project, exported as file-safe **keys**: lowercased, spaces → `_`, characters a file name can't carry (`: / \ * ? " < > |`) → `_`, trailing dots dropped, Windows reserved stems (`CON`, `NUL`, …) suffixed with `_`, 64 characters max — so an event named `Boss: Phase/One` is called as `boss__phase_one`. Lookup is exact; the engine does not normalize at call time. Every pack's README lists the key for each event, and `PFA.get_event_names()` returns exactly what the pack loaded.
 
 ---
 
 ## Loading & Memory
+
+Both loaders answer `true` / `false`: input that isn't a pack this addon can read — JSON that is not a config, a damaged bank, a config schema newer than the addon — is refused with one error in the log, and whatever was loaded before keeps playing.
 
 `load_pack()` / `load_bank()` parse events and groups but load **no audio** (lazy). An event's samples load synchronously on its first trigger — for a multi-variation WAV event that first-trigger stall can audibly click. Pick a strategy:
 
@@ -63,6 +81,43 @@ PFA.load_bank("res://audio/project.pfabank")
 PFA.preload_all()
 PFA.release_bank_buffer()    # free the raw bank bytes; audio stays in AudioStreams
 ```
+
+---
+
+## Exporting Your Game
+
+A pack that works in the editor does not automatically reach the **exported build**: Godot packs resources plus whatever the export preset's *Filters to export non-resource files/folders* names, and nothing else. What that means for a PFA pack:
+
+| What you ship | In the exported build |
+|---|---|
+| `config.json` | ships as-is (Godot treats it as a resource) |
+| OGG / MP3 / WAV samples | imported by Godot and loaded through `ResourceLoader` — the source file is gone from the build, the addon handles that |
+| Samples in a format Godot has no importer for (OPUS, AAC, FLAC, AIFF) | **do not ship** — export the pack as OGG / MP3 / WAV for Godot targets |
+| `.pfabank` | shipped by **this plugin** (unknown extensions are dropped otherwise) |
+
+The plugin adds every `.pfabank` in the project to the export automatically — a bank the preset already lists in its filters is not added twice. To opt out (a project that ships loose packs only), set the project setting:
+
+```
+pfa_engine/export/include_pfabank = false
+```
+
+**Packs outside the project.** In an exported game `res://` lives inside the binary, so `ProjectSettings.globalize_path("res://")` returns an empty string and a path built from it silently becomes relative to the *current working directory* — it will find the pack when you launch from a terminal and miss it when the player double-clicks the game. Two paths that do work:
+
+```gdscript
+# 1. Downloaded / DLC pack — user:// is a real, writable directory on every platform
+PFA.load_pack("user://packs/dlc1/config.json")
+
+# 2. Pack shipped next to the game, loaded from disk instead of the build
+func _pack_dir() -> String:
+    if OS.has_feature("editor"):
+        return ProjectSettings.globalize_path("res://audio")
+    var base := OS.get_executable_path().get_base_dir()
+    if OS.has_feature("macos"):
+        base = base.get_base_dir().get_base_dir().get_base_dir()   # step out of the .app bundle
+    return base.path_join("audio")
+```
+
+If a bank or a sample is missing from a build, the addon says so in the log and names the fix — it does not fail silently.
 
 ---
 
@@ -232,7 +287,7 @@ PFA.trigger_spatial_3d("ball_hit", p.x, p.y, p.z, {"intensity": clampf(rel_speed
 
 The mapping is **authored in Studio** (the event's `intensity` block: `vol_db` / `pitch_st` ranges + curves) and applied per voice on top of the random variation. Events without an intensity block ignore the value — the game can always pass it. Identical math in the JS engine.
 
-Real-world example (the billiards demo, `games/04_billiards/godot/`): 5 events — cue strike, ball hit, cushion, pocket, rolling loop — where every trigger passes `clampf(speed / max_speed, 0, 1)` and one `create_emitter_3d("ball_roll")` per rolling ball follows it with `set_position_3d` until `destroy()` on stop.
+Real-world example — the billiards demo: 5 events — cue strike, ball hit, cushion, pocket, rolling loop — where every trigger passes `clampf(speed / max_speed, 0, 1)` and one `create_emitter_3d("ball_roll")` per rolling ball follows it with `set_position_3d` until `destroy()` on stop.
 
 ---
 
@@ -345,7 +400,7 @@ This addon versions independently from the rest of the suite (Studio 0.9.x, JS e
 
 **This addon is MIT** — free for commercial and personal use, no attribution required.
 
-It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is plain JSON — the addon reads a `config.json`, whatever produced it.
+It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON `config.json` next to the audio files, or a single `.pfabank` container carrying that same JSON plus the audio — the addon reads either, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)

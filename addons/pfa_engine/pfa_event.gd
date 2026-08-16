@@ -29,12 +29,35 @@ signal level_applied(level: int)
 ## `PFA.debug_logs = true` (autoload property mirrors this static).
 static var debug_logs: bool = false
 
+## Studio's single-file bank container. Named here because the runtime has to tell a
+## missing bank apart from a missing sample when a build ships without it.
+const BANK_EXTENSION := "pfabank"
+
 static func _dlog(msg: String) -> void:
 	if debug_logs:
 		print(msg)
 
+## Explain a `res://` file that exists in the editor and is gone from the exported build.
+## Godot packs resources and whatever the preset's non-resource filters name — a `.pfabank`
+## or an audio format Godot has no importer for is neither, so it silently never ships and
+## the game reports a plain "not found" the author cannot act on. Empty string whenever the
+## failure is anything else (running in the editor, permissions, a genuinely wrong path).
+static func _export_missing_hint(path: String, open_error: int,
+		in_editor: bool = OS.has_feature("editor")) -> String:
+	if open_error != ERR_FILE_NOT_FOUND or not path.begins_with("res://") or in_editor:
+		return ""
+	var ext: String = path.get_extension().to_lower()
+	var hint: String = " — the file is missing from this BUILD (it is there in the editor):"
+	hint += " Godot ships resources plus whatever the export preset's \"Filters to export"
+	hint += " non-resource files/folders\" names, and \"*.%s\" is neither." % ext
+	if ext == BANK_EXTENSION:
+		hint += " Enable the PFA Engine plugin — it adds banks to the export — or add that filter."
+	else:
+		hint += " Export the audio as OGG / MP3 / WAV, which Godot imports, or add that filter."
+	return hint
+
 ## Runtime event — manages playback of tracks for one music/sfx event.
-## Faithful port of JS PFAEvent (pfa-engine/js/src/index.js L1257-2351).
+## Faithful port of the JS engine's PFAEvent.
 ##
 ## Godot adaptations:
 ##   - No Web Audio gain chain → one AudioStreamPlayer per (track, level, variation).
@@ -116,7 +139,7 @@ var _pending_fade_out_switch: SceneTreeTimer = null
 
 # Generation token guarding stop_playback()'s deferred player teardown against a
 # start_playback() landing inside the 25 ms anti-click window (replay race).
-# JS parity: PFAEvent._stopGen (fix cab3407). Mirrors the FMOD/Wwise per-voice
+# JS parity: PFAEvent._stopGen. Mirrors the FMOD/Wwise per-voice
 # lifecycle — a new voice supersedes the previous one's pending release.
 var _stop_gen: int = 0
 
@@ -157,7 +180,7 @@ var _samples_loaded: bool = false
 var _play_start_time: float = 0.0
 ## −∞ epoch, NOT 0.0: ticks start at process launch, so a 0.0 init silently muted
 ## any event whose cooldown_ms exceeded the game's uptime at first trigger
-## (uptime − 0 < cooldown). Found by the sess122 voice-stealing red suite.
+## (uptime − 0 < cooldown). Found by the voice-stealing red suite.
 var _last_trigger_time_ms: float = -1.0e12
 var _active_sfx_count: int = 0
 
@@ -206,7 +229,7 @@ var _level_phase_anchors: Dictionary = {}
 ## timer is dropped. This is the "revert pending transition" pattern from Wwise
 ## Music Transition Rules and the spiritual equivalent of Web Audio's
 ## GainNode.cancelScheduledValues() used by the JS engine in activateLevel
-## (pfa-engine/js/src/index.js activateLevel → cancelScheduledValues).
+## (the JS engine's activateLevel → cancelScheduledValues).
 ##
 ## Why needed: Godot's SceneTreeTimer + lambda model means a loop-boundary-bound
 ## schedule can fire AFTER navigate() has moved current_level to a different
@@ -248,7 +271,7 @@ func start_playback() -> void:
 	# the players this start uses. Inside that window _prestart_track_level_specific /
 	# _play_music_shared early-return on existing state, so the still-playing players
 	# carry on as this start's own (nothing leaks when the stale teardown skips).
-	# JS parity: play() (_stopGen, cab3407).
+	# JS parity: play() (_stopGen).
 	_stop_gen += 1
 
 	if not _samples_loaded:
@@ -434,7 +457,7 @@ func trigger_sfx(options: Dictionary = {}) -> Array:
 	# Resolved ONCE here (the event owns the curve config); every track voice for
 	# this trigger gets the same offset. Neutral {1,0} when disabled/absent. A bare
 	# trigger (no intensity key) ⇒ 1.0 (full-strength hit). Resolved BEFORE the cap
-	# gate — the candidate's audibility score needs it (voice stealing, sess122).
+	# gate — the candidate's audibility score needs it (voice stealing).
 	var iv: Dictionary = PFATrack.intensity_gain_pitch(float(options.get("intensity", 1.0)), intensity)
 
 	if not _check_can_trigger(float(iv.get("gain_mult", 1.0)) * _max_track_volume(), 1.0, tracks.size()):
@@ -1500,7 +1523,7 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 
 	# Equal-power crossfade: OLD → 0, NEW → track_target_amp.
 	# sin/cos quadrant gives constant combined power through the splice → no volume dip.
-	# Matches JS pattern (L2114-2143) which sets gain.setValueAtTime(0,t)+linearRamp(1,t+2ms)
+	# Matches the JS pattern, which sets gain.setValueAtTime(0,t)+linearRamp(1,t+2ms)
 	# on new variationGain and the reverse on old — constant-power when both are same signal.
 	_equal_power_tween_to_amp(old_player, 0.0, _MICRO_FADE_SEC)
 	var new_tween: Tween = _equal_power_tween_to_amp(new_player, track_target_amp, _MICRO_FADE_SEC)
@@ -1919,7 +1942,7 @@ func _disable_sub_level(_sub: Dictionary, sub_name: String, fade_dur: float) -> 
 	for p in players:
 		if is_instance_valid(p):
 			_equal_power_tween_to_amp(p, 0.0, fade_dur)
-	# Teardown must OUTLAST the ramp (a5a350b contract): the tween floors a sub-floor
+	# Teardown must OUTLAST the ramp (micro-fade contract): the tween floors a sub-floor
 	# fade_dur to _MICRO_FADE_SEC internally, so size the timer from the EFFECTIVE fade
 	# + the render margin — a raw fade_dur+0.01 fired mid-ramp at an audible level.
 	var eff_fade: float = fade_dur
@@ -1943,7 +1966,7 @@ func _disable_sub_level(_sub: Dictionary, sub_name: String, fade_dur: float) -> 
 ## Stop all sub-levels "immediately" = anti-click micro-fade, then free. Called on node
 ## entry (live event gain!) and from the stop-teardown. The old 20ms-ask/25ms-timer pair
 ## raced the tween's internal _MICRO_FADE_SEC floor — p.stop() fired ~1 frame before
-## silence at an audible residual (the a5a350b race, missed in this sibling).
+## silence at an audible residual (the same race, missed in this sibling).
 func _stop_all_sub_levels_immediate() -> void:
 	for sub_name in _sub_level_states.keys():
 		var state: Dictionary = _sub_level_states[sub_name]
@@ -2101,8 +2124,8 @@ func _pick_stinger_variant(bundle: Dictionary) -> int:
 # ── SFX ───────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
-## Cooldown + max_instances gate — voice stealing by AUDIBILITY (sess122; spawn-
-## size steal sess124).
+## Cooldown + max_instances gate — voice stealing by AUDIBILITY (spawn-size
+## steal included).
 ##
 ## ONE pool per event: flat (_sfx_voices) + spatial (_spatial_voices) count together.
 ## Score = pre_amp (track × clip × rand × intensity, spawn meta) × distance factor
@@ -2122,11 +2145,11 @@ func _pick_stinger_variant(bundle: Dictionary) -> int:
 ##     authored release_fade. A steal is not an authored stop: borrowing the
 ##     authored fade kept slot-free voices audible ~574 ms past eviction, so
 ##     "audible ≤ cap" broke and a smaller cap could ring LOUDER than a bigger
-##     one (sess125 defect B). Authored release stays on game stop()/destroy().
+##     one. Authored release stays on game stop()/destroy().
 ## cap <= 0 ⇒ uncapped (the documented spatial semantic, now unified).
 ## `candidate_amp/_dist` default to 1.0 — an optimistic candidate estimate (clip
 ## volume / rand unknown until the variation pick) so rejection stays conservative.
-## JS: _checkCanTrigger (1f4fdd1).
+## JS: _checkCanTrigger.
 func _check_can_trigger(candidate_amp: float = 1.0, candidate_dist: float = 1.0,
 		spawn_count: int = 1) -> bool:
 	var now_ms: float = Time.get_ticks_msec()
@@ -2167,7 +2190,7 @@ func _check_can_trigger(candidate_amp: float = 1.0, candidate_dist: float = 1.0,
 				if v["spatial"]:
 					# 0.0 = "as fast as click-free allows" (_STOP_FLOOR_SEC), NOT
 					# -1.0 = the authored release_fade — that fade belongs to
-					# game-driven stop()/destroy() only (sess125 defect B).
+					# game-driven stop()/destroy() only.
 					_spatial_mgr._release_voice(v["player"], 0.0)
 				else:
 					_release_sfx_voice(v["player"])
@@ -2284,7 +2307,7 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 	# Voice lifecycle timers are Timer CHILDREN of the player, not tree-scoped
 	# SceneTreeTimers: a child dies WITH the player, so no timeout lambda can ever fire
 	# with a freed `player` capture ("Lambda capture at index 0 was freed" — the race
-	# fixed in pfa_spatial 238d8ab; HERE max_instances eviction frees a voice while its
+	# fixed in pfa_spatial; HERE max_instances eviction frees a voice while its
 	# trim-stop/delay timer is still pending, which made the error deterministic).
 	# Bonus: child timers pause in sync with the audio they control (SceneTreeTimers
 	# default to process_always and would cut a paused voice mid-pause).

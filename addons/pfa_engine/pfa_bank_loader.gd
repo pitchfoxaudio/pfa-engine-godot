@@ -23,29 +23,39 @@ var _data_offset: int = 0
 
 
 ## Load and parse a .pfabank file. Returns true on success.
+##
+## Every structural claim in the container is verified BEFORE a byte of it becomes
+## loader state: a damaged bank must fail as a clean `false`, never as a plausible
+## slice that decodes into noise. Sections that leave the file, overlap each other
+## or the directory, a missing/empty JSON section, a size the header disagrees with,
+## and audio entries pointing outside DATA are all rejected here. On any failure the
+## previously loaded bank stays intact.
 func load_bank(path: String) -> bool:
 	var file = FileAccess.open(path, FileAccess.READ)
 	if file == null:
-		push_error("[PFA Bank] Cannot open: %s (error: %s)" % [path, FileAccess.get_open_error()])
+		var open_error: int = FileAccess.get_open_error()
+		push_error("[PFA Bank] Cannot open: %s (error: %s)%s" % [
+			path, open_error, PFAEvent._export_missing_hint(path, open_error)])
 		return false
 
-	# Read entire file into memory
-	_bank_data = file.get_buffer(file.get_length())
+	# Read entire file into memory (a local until the whole container validates)
+	var data: PackedByteArray = file.get_buffer(file.get_length())
 	file.close()
 
-	if _bank_data.size() < HEADER_SIZE:
-		push_error("[PFA Bank] File too small: %d bytes" % _bank_data.size())
+	var size: int = data.size()
+	if size < HEADER_SIZE:
+		push_error("[PFA Bank] File too small: %d bytes" % size)
 		return false
 
 	# Validate magic bytes
-	var magic = _bank_data.slice(0, 8).get_string_from_ascii()
-	if magic.substr(0, 7) != "PFABANK":
+	var magic = data.slice(0, 8).get_string_from_ascii()
+	if magic.substr(0, 7) != MAGIC:
 		push_error("[PFA Bank] Invalid magic: %s" % magic)
 		return false
 
 	# Parse header (little-endian)
 	var view = StreamPeerBuffer.new()
-	view.data_array = _bank_data
+	view.data_array = data
 
 	view.seek(8)
 	var ver_major = view.get_u16()
@@ -61,22 +71,55 @@ func load_bank(path: String) -> bool:
 
 	PFAEvent._dlog("[PFA Bank] v%d.%d, %d sections, %d bytes" % [ver_major, ver_minor, section_count, file_size])
 
+	# Format version: a future major carries a layout this parser does not know.
+	if ver_major != 1:
+		push_error("[PFA Bank] Unsupported bank version: %d.%d" % [ver_major, ver_minor])
+		return false
+
+	# The header states its own file size — the cheapest truncation/append detector.
+	if file_size != size:
+		push_error("[PFA Bank] Size mismatch: header says %d bytes, file is %d" % [file_size, size])
+		return false
+
+	# Section directory must lie inside the file, after the header.
+	var dir_end: int = section_dir_off + section_count * section_entry_size
+	if section_count <= 0 or section_entry_size < SECTION_ENTRY_SIZE \
+			or section_dir_off < HEADER_SIZE or dir_end > size:
+		push_error("[PFA Bank] Damaged section directory (offset=%d, count=%d, entry=%d, file=%d)" % [
+			section_dir_off, section_count, section_entry_size, size])
+		return false
+
 	# Parse section directory
 	var json_offset: int = 0
 	var json_length: int = 0
 	var data_offset: int = 0
 	var data_length: int = 0
+	var ranges: Array = []  # [ { "type": String, "offset": int, "length": int } ]
 
 	view.seek(section_dir_off)
 	for i in range(section_count):
 		var section_start = view.get_position()
-		var section_type = _bank_data.slice(section_start, section_start + 4).get_string_from_ascii()
+		var section_type = data.slice(section_start, section_start + 4).get_string_from_ascii()
 		view.seek(section_start + 4)
 		var sec_flags = view.get_u32()
 		var sec_offset = view.get_u64()
 		var sec_length = view.get_u64()
 		var sec_ver = view.get_u32()
 		var sec_reserved = view.get_u32()
+
+		# Every section body lives after the directory and inside the file.
+		if sec_offset < dir_end or sec_length < 0 or sec_offset + sec_length > size:
+			push_error("[PFA Bank] Section %s out of bounds (offset=%d, length=%d, file=%d)" % [
+				section_type, sec_offset, sec_length, size])
+			return false
+		for other in ranges:
+			# Overlapping sections are the damage class that survives every other
+			# check: audio would be sliced relative to the wrong section and decode
+			# as garbage instead of failing.
+			if sec_offset < other["offset"] + other["length"] and other["offset"] < sec_offset + sec_length:
+				push_error("[PFA Bank] Sections %s and %s overlap" % [section_type, other["type"]])
+				return false
+		ranges.append({"type": section_type, "offset": sec_offset, "length": sec_length})
 
 		if section_type == "JSON":
 			json_offset = sec_offset
@@ -87,14 +130,12 @@ func load_bank(path: String) -> bool:
 
 		view.seek(section_start + section_entry_size)
 
-	_data_offset = data_offset
-
 	# Parse JSON section
 	if json_length == 0:
 		push_error("[PFA Bank] No JSON section found")
 		return false
 
-	var json_bytes = _bank_data.slice(json_offset, json_offset + json_length)
+	var json_bytes = data.slice(json_offset, json_offset + json_length)
 	var json_string = json_bytes.get_string_from_utf8()
 
 	var json = JSON.new()
@@ -103,10 +144,36 @@ func load_bank(path: String) -> bool:
 		push_error("[PFA Bank] JSON parse error: %s" % json.get_error_message())
 		return false
 
-	config = json.data
+	if not (json.data is Dictionary):
+		push_error("[PFA Bank] Bank JSON is not an object")
+		return false
 
-	# Extract audio entries map and remove from config
-	audio_entries = config.get("_audio_entries", {})
+	var parsed: Dictionary = json.data
+	var entries: Variant = parsed.get("_audio_entries", {})
+	if not (entries is Dictionary):
+		push_error("[PFA Bank] Bank _audio_entries is not an object")
+		return false
+
+	# Every audio entry must resolve inside DATA — checked once here instead of
+	# per slice, so a damaged directory can never reach a decoder.
+	for rel_path in (entries as Dictionary):
+		var entry: Variant = (entries as Dictionary)[rel_path]
+		if not (entry is Dictionary):
+			push_error("[PFA Bank] Audio entry %s is not an object" % rel_path)
+			return false
+		var e_off: int = int((entry as Dictionary).get("offset", -1))
+		var e_len: int = int((entry as Dictionary).get("length", -1))
+		if e_off < 0 or e_len < 0 or e_off + e_len > data_length \
+				or data_offset + e_off + e_len > size:
+			push_error("[PFA Bank] Audio entry out of bounds: %s (offset=%d, length=%d, data=%d)" % [
+				rel_path, e_off, e_len, data_length])
+			return false
+
+	# Container is sound — commit it as loader state.
+	_bank_data = data
+	_data_offset = data_offset
+	config = parsed
+	audio_entries = entries
 	config.erase("_audio_entries")
 
 	PFAEvent._dlog("[PFA Bank] Loaded: %d events, %d audio entries" % [

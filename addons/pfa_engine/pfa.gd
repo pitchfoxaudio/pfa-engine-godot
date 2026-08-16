@@ -56,6 +56,41 @@ var _reverb: PFAReverb = null           # reverb-zone manager (created when a pa
 
 # --- Public API ---
 
+## Structural intake gate — the ONE place a pack is accepted or refused. Returns
+## "" when the config may become engine state, otherwise the human reason.
+## It refuses input that is not a Studio pack at all (wrong shape, foreign or
+## future schema) and stays deliberately tolerant about AUTHORING: a declared but
+## empty pack is legal, and unknown extra keys are ignored as always. Without this
+## gate every loader reported success for `{}` / `[]` / someone else's JSON, and
+## the game only found out much later as missing or silently wrong playback.
+## JS parity: PFA._configRefusal.
+static func _config_refusal(data: Variant) -> String:
+	if not (data is Dictionary):
+		return "config is not a JSON object"
+	var cfg: Dictionary = data
+	if cfg.has("version"):
+		var ver: String = str(cfg["version"])
+		if ver.split(".")[0] != "1":
+			return "config schema %s is not supported (this engine implements 1.x)" % ver
+	elif not cfg.has("events"):
+		return "not a PFA pack (neither \"version\" nor \"events\")"
+	if cfg.has("events") and not (cfg["events"] is Dictionary):
+		return "\"events\" is not an object"
+	if cfg.has("groups") and not (cfg["groups"] is Array):
+		return "\"groups\" is not an array"
+	return ""
+
+## Load-bearing numeric intake. A config carrying INF/NaN/negative where the engine
+## multiplies gains or counts voices plays silently wrong instead of failing, so an
+## out-of-contract value falls back to the documented default. JS parity: _saneAmp.
+static func _sane_amp(value: Variant, fallback: float) -> float:
+	if not (value is float or value is int):
+		return fallback
+	var f: float = float(value)
+	if not is_finite(f) or f < 0.0:
+		return fallback
+	return f
+
 ## Load audio pack from config.json exported by PFA Studio.
 func load_pack(config_path: String) -> bool:
 	var file = FileAccess.open(config_path, FileAccess.READ)
@@ -71,10 +106,21 @@ func load_pack(config_path: String) -> bool:
 		push_error("[PFA] JSON parse error in %s: %s" % [config_path, json.get_error_message()])
 		return false
 
+	# Gate BEFORE any engine state moves: a refused pack leaves the currently
+	# loaded one playing untouched (a live game must not go silent because a
+	# reload pointed at the wrong file).
+	var refusal: String = _config_refusal(json.data)
+	if refusal != "":
+		push_error("[PFA] Refused pack %s: %s" % [config_path, refusal])
+		return false
+
 	_config = json.data
 	_base_path = config_path.get_base_dir()
 	pack_path = config_path
-	_master_volume = _config.get("master_volume", 1.0)
+	# Loose pack ⇒ leave bank mode. A previous bank kept its whole buffer resident
+	# and release_bank_buffer() would still be aiming at that dead generation.
+	_bank_loader = null
+	_master_volume = _sane_amp(_config.get("master_volume", 1.0), 1.0)
 
 	# Parse groups
 	_groups.clear()
@@ -107,14 +153,27 @@ func load_pack(config_path: String) -> bool:
 
 ## Load audio pack from .pfabank binary bank (single file, all audio inside).
 func load_bank(bank_path: String) -> bool:
-	_bank_loader = PFABankLoader.new()
-	if not _bank_loader.load_bank(bank_path):
-		_bank_loader = null
+	# Parse into a CANDIDATE, exactly like the loose path gates before it moves
+	# any state: this used to assign the new loader to _bank_loader up front and
+	# null it on refusal, so a damaged second bank evicted the working one. The
+	# events keep their own reference and go on playing, which is what hid it —
+	# but release_bank_buffer() is guarded by _bank_loader, so the documented way
+	# to free the bank's memory silently died for the rest of the session.
+	var candidate := PFABankLoader.new()
+	if not candidate.load_bank(bank_path):
 		return false
 
+	# Same gate as the loose path — a bank whose container parsed fine can still
+	# carry a foreign or empty config.
+	var refusal: String = _config_refusal(candidate.config)
+	if refusal != "":
+		push_error("[PFA] Refused bank %s: %s" % [bank_path, refusal])
+		return false
+
+	_bank_loader = candidate
 	_config = _bank_loader.config
 	_base_path = ""  # not used in bank mode
-	_master_volume = _config.get("master_volume", 1.0)
+	_master_volume = _sane_amp(_config.get("master_volume", 1.0), 1.0)
 
 	# Parse groups
 	_groups.clear()
@@ -554,7 +613,7 @@ func _create_event(event_name: String, data: Dictionary) -> PFAEvent:
 	var event = PFAEvent.new()
 	event.name = event_name
 	event.type = data.get("type", "music")
-	event.volume = data.get("volume", 1.0)
+	event.volume = _sane_amp(data.get("volume", 1.0), 1.0)
 	event._master_volume = _master_volume
 	event._base_path = _base_path
 
@@ -606,8 +665,10 @@ func _create_event(event_name: String, data: Dictionary) -> PFAEvent:
 
 	# SFX-specific
 	if event.type == "sfx":
-		event.cooldown_ms = data.get("cooldown_ms", 0.0)
-		event.max_instances = data.get("max_instances", 8)
+		event.cooldown_ms = _sane_amp(data.get("cooldown_ms", 0.0), 0.0)
+		# 0 stays 0 — the documented "uncapped" value; only INF/NaN/negative
+		# (which would silently uncap an authored ceiling) fall back to the default.
+		event.max_instances = int(_sane_amp(data.get("max_instances", 8), 8.0))
 
 	# Levels
 	event.levels = []

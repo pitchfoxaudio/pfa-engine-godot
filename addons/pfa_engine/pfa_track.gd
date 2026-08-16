@@ -1,7 +1,7 @@
 class_name PFATrack
 extends RefCounted
 
-## A track within an event. Faithful port of JS PFATrack (pfa-engine/js/src/index.js L2357-3070).
+## A track within an event. Faithful port of the JS engine's PFATrack.
 ##
 ## Data-only class in Godot — AudioStreamPlayer management lives in PFAEvent (because
 ## AudioStreamPlayer must be a Node, and PFATrack extends RefCounted for config-load simplicity).
@@ -429,7 +429,8 @@ func _load_audio_file(path: String) -> AudioStream:
 		return ResourceLoader.load(path)
 
 	if not FileAccess.file_exists(path):
-		push_warning("[PFA] Cannot load audio: %s" % path)
+		push_warning("[PFA] Cannot load audio: %s%s" % [
+			path, PFAEvent._export_missing_hint(path, ERR_FILE_NOT_FOUND)])
 		return null
 
 	if path.ends_with(".ogg"):
