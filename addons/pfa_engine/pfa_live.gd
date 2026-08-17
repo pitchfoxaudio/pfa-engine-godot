@@ -24,7 +24,7 @@ signal log_message(msg: String)
 ## ambiences / music here (stop_all killed the voices; emitters survived).
 signal pack_reloaded
 
-const ENGINE_VERSION := "0.11.2"
+const ENGINE_VERSION := "0.11.3"
 const DEFAULT_PORT := 9264
 const RECONNECT_DELAY := 5.0       # JS parity: fixed 5 s retry
 const RELOAD_SETTLE := 0.6         # JS parity: lets stop_all's 0.5 s fade ring out

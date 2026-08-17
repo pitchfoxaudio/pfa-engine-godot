@@ -131,6 +131,15 @@ func load_pack(config_path: String) -> bool:
 		group.event_names = group_data.get("events", [])
 		_groups[group.name] = group
 
+	# The outgoing generation goes silent FIRST, spatial half included: spatial
+	# voices and smart-loop controllers are standalone nodes under PFASpatial, not
+	# children of the event nodes, so freeing the events alone left a seamless
+	# spatial loop playing the OLD pack forever with no per-event door left to
+	# reach it (stop matches by event object). Emitters survive — they belong to
+	# game objects and re-resolve by name. JS parity: _applyConfig stopAll(0).
+	if _spatial != null:
+		_spatial.stop_all_voices(0.0)
+
 	# Parse events. On a RE-load (Live Connect reload) free the previous
 	# generation's event nodes — dict.clear() alone leaks them as children.
 	for old in _events.values():
@@ -183,6 +192,11 @@ func load_bank(bank_path: String) -> bool:
 		group.volume = group_data.get("volume", 1.0)
 		group.event_names = group_data.get("events", [])
 		_groups[group.name] = group
+
+	# Same commit order as load_pack: the outgoing generation's spatial half goes
+	# silent before its event nodes are freed (emitters survive by design).
+	if _spatial != null:
+		_spatial.stop_all_voices(0.0)
 
 	# Parse events. On a RE-load (Live Connect reload) free the previous
 	# generation's event nodes — dict.clear() alone leaks them as children.

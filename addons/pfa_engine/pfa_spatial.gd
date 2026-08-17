@@ -61,6 +61,13 @@ var _pfa: Node = null
 
 var _voices: Array = []             # all live AudioStreamPlayer2D/3D voices (for cleanup)
 var _emitters: Array = []           # live PFASpatialEmitter instances
+# EVERY live smart-loop controller, emitter-owned or not. The controller is what
+# re-spawns audible voices each cycle, so every stop door must be able to reach
+# it — before this registry, an emitter-less controller (plain trigger_spatial on
+# a smart-loop event) was reachable by NOBODY: stop()/stop_all() faded the voice
+# and the controller spawned the next one anyway (JS parity: the emitter-less
+# re-loop chain is voice-owned there and dies inside voice.stop()).
+var _smart_ctrls: Array = []
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -434,6 +441,7 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 func _start_smart_loop(event, track, mode: String, pos: Vector3, cfg: Dictionary, release_ms: float, emitter) -> Dictionary:
 	# `event` lets stop_event_voices() kill just THIS event's controllers (PFA.stop parity).
 	var ctrl := {"stopped": false, "active": null, "last_len": 1.0, "first": true, "pos": pos, "event": event}
+	_smart_ctrls.append(ctrl)
 	if emitter != null:
 		emitter._smart_loops.append(ctrl)
 	_smart_tick(ctrl, event, track, mode, cfg, release_ms, emitter)
@@ -441,7 +449,13 @@ func _start_smart_loop(event, track, mode: String, pos: Vector3, cfg: Dictionary
 
 
 func _smart_tick(ctrl: Dictionary, event, track, mode: String, cfg: Dictionary, release_ms: float, emitter) -> void:
-	if ctrl.get("stopped", false) or (emitter != null and emitter._destroyed):
+	# A dead controller unregisters itself on its final wake-up (SceneTreeTimers
+	# can't be aborted). The validity guard is the load_pack/free class: a tick
+	# must never touch an event the reload already freed — same contract as the
+	# int-capture guards on PFAEvent's own timers.
+	if ctrl.get("stopped", false) or (emitter != null and emitter._destroyed) \
+			or not is_instance_valid(event):
+		_smart_ctrls.erase(ctrl)
 		return
 	var level: int = event.current_level
 	var play: bool = ctrl.get("first", true) or track.roll_play_chance(level)
@@ -715,9 +729,13 @@ func refresh_event_voices(event, fade_sec: float = 0.05) -> void:
 ## JS PFA.stopAll parity (smart controllers must die here or their timers
 ## resurrect the OLD pack across a Live Connect reload — the JS zombie bug).
 func stop_all_voices(fade_ms: float = 0.0) -> void:
+	# The registry reaches EVERY controller — the emitter lists below only hold
+	# the emitter-owned subset (an emitter-less trigger_spatial chain lives in the
+	# registry alone).
+	for ctrl in _smart_ctrls:
+		ctrl["stopped"] = true
+	_smart_ctrls.clear()
 	for e in _emitters:
-		for ctrl in e._smart_loops:
-			ctrl["stopped"] = true
 		e._smart_loops.clear()
 		e._players.clear()
 	for p in _voices.duplicate():
@@ -731,12 +749,17 @@ func stop_all_voices(fade_ms: float = 0.0) -> void:
 ## controllers must stop too — a live controller would re-spawn an AUDIBLE voice next
 ## cycle (in JS a re-spawn enters the silenced event gain instead).
 func stop_event_voices(event, fade_ms: float = 0.0) -> void:
+	var keep_ctrls: Array = []
+	for ctrl in _smart_ctrls:
+		if ctrl.get("event", null) == event:
+			ctrl["stopped"] = true
+		else:
+			keep_ctrls.append(ctrl)
+	_smart_ctrls = keep_ctrls
 	for e in _emitters:
 		var keep: Array = []
 		for ctrl in e._smart_loops:
-			if ctrl.get("event", null) == event:
-				ctrl["stopped"] = true
-			else:
+			if not ctrl.get("stopped", false):
 				keep.append(ctrl)
 		e._smart_loops = keep
 	for p in _voices.duplicate():
@@ -749,6 +772,9 @@ func stop_event_voices(event, fade_ms: float = 0.0) -> void:
 ## destroy(0.0) pass just started (tween dies with its player). Click-safety on a scene
 ## swap is the game's job — fade to black / let stops finish BEFORE change_scene.
 func clear_all() -> void:
+	for ctrl in _smart_ctrls:
+		ctrl["stopped"] = true
+	_smart_ctrls.clear()
 	for e in _emitters.duplicate():
 		e.destroy(0.0)
 	for p in _voices.duplicate():
