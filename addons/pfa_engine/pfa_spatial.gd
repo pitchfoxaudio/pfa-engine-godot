@@ -405,7 +405,7 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 					if is_instance_valid(player) and not bool(player.get_meta("stopped", false)):
 						player.stop()
 						_free_voice(player)
-				)
+				, CONNECT_ONE_SHOT)
 				stop_t.start()
 
 	if delay_ms > 0.0:
@@ -413,7 +413,7 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 		delay_t.one_shot = true
 		delay_t.wait_time = delay_ms / 1000.0
 		player.add_child(delay_t)
-		delay_t.timeout.connect(start_cb)
+		delay_t.timeout.connect(start_cb, CONNECT_ONE_SHOT)
 		delay_t.start()
 	else:
 		start_cb.call()
@@ -483,7 +483,11 @@ func _smart_tick(ctrl: Dictionary, event, track, mode: String, cfg: Dictionary, 
 	if not ctrl.get("stopped", false) and (emitter == null or not emitter._destroyed):
 		var period: float = maxf(0.05, float(ctrl.get("last_len", 1.0)) - _SMART_CROSS)
 		var t := get_tree().create_timer(period)
-		t.timeout.connect(_smart_tick.bind(ctrl, event, track, mode, cfg, release_ms, emitter))
+		# One-shot (see the note in pfa_event.stop_playback): this chain re-arms once
+		# per clip length, so a connection that outlives its emit would strand one
+		# SceneTreeTimer per tick for as long as the loop plays — the worst instance of
+		# the class in the addon.
+		t.timeout.connect(_smart_tick.bind(ctrl, event, track, mode, cfg, release_ms, emitter), CONNECT_ONE_SHOT)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -516,8 +520,9 @@ func _overlay_cfg(out: Dictionary, layer: Dictionary) -> void:
 
 ## Model name → Godot 3D attenuation model. The editor's GODOT platform authors Godot's NATIVE
 ## model names (inverse / inverse_square / logarithmic / disabled). Web-vocabulary names (old configs
-## with only the flat keys) are accepted too: exponential → inverse-square, linear → logarithmic
-## (Godot has no native linear 3D model). (2D uses a single falloff exponent instead.)
+## with only the flat keys) are accepted too: exponential → inverse-square, linear → ATTENUATION_DISABLED
+## (no model curve — Godot's built-in `1 - dist/max` factor alone IS a true linear fade; see the
+## branch below). (2D uses a single falloff exponent instead.)
 func _model_to_3d_attenuation(model: String) -> int:
 	match model:
 		"inverse_square", "exponential":

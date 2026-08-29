@@ -375,8 +375,8 @@ func sfx_volume_rand_linear() -> float:
 		return db_to_linear(randf_range(min_db, max_db))
 	return 1.0
 
-## Intensity (velocity) curve shape — IDENTICAL to the JS engine (_intensityShape)
-## and the design doc. t in [0,1]; every shape maps 0->0 and 1->1.
+## Intensity (velocity) curve shape — IDENTICAL to the JS engine (_intensityShape).
+## t in [0,1]; every shape maps 0->0 and 1->1.
 static func intensity_shape(curve: String, t: float) -> float:
 	match curve:
 		"exponential": return t * t                 # slow->fast (perceptual loudness)
@@ -387,8 +387,8 @@ static func intensity_shape(curve: String, t: float) -> float:
 ## Map a normalized intensity (0..1, default 1.0) through an event's authored
 ## `intensity` config -> { gain_mult, pitch_st }. Disabled / empty ⇒ the neutral
 ## { 1.0, 0.0 } (zero behaviour change). IDENTICAL math to the JS engine
-## (_intensityToGainPitch) — see doc «Intensity (velocity) feature — design + curve
-## reference». vol_db / pitch_st are [value at intensity 0, at intensity 1].
+## (_intensityToGainPitch); the curve shapes are the four in intensity_shape
+## above. vol_db / pitch_st are [value at intensity 0, value at intensity 1].
 static func intensity_gain_pitch(intensity: float, cfg: Dictionary) -> Dictionary:
 	if cfg.is_empty() or not bool(cfg.get("enabled", false)):
 		return {"gain_mult": 1.0, "pitch_st": 0.0}

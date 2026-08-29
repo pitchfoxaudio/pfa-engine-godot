@@ -95,7 +95,7 @@ A pack that works in the editor does not automatically reach the **exported buil
 | Samples in a format Godot has no importer for (OPUS, AAC, FLAC, AIFF) | **do not ship** — export the pack as OGG / MP3 / WAV for Godot targets |
 | `.pfabank` | shipped by **this plugin** (unknown extensions are dropped otherwise) |
 
-The plugin adds every `.pfabank` in the project to the export automatically — a bank the preset already lists in its filters is not added twice. To opt out (a project that ships loose packs only), set the project setting:
+The plugin adds every `.pfabank` in the project to the export automatically — hidden directories (any name starting with `.`, including `.godot` / `.git`) are not scanned, so a bank kept there needs an explicit export-preset filter. A bank the preset already lists in its filters is not added twice. To opt out (a project that ships loose packs only), set the project setting:
 
 ```
 pfa_engine/export/include_pfabank = false
@@ -122,6 +122,12 @@ If a bank or a sample is missing from a build, the addon says so in the log and 
 ---
 
 ## API Reference
+
+### Identity
+
+| Constant | Description |
+|--------|-------------|
+| `PFA.VERSION → String` | The addon release, e.g. `"0.11.6"` — the same spelling as the web engine's `PFA.VERSION`. Print it in a bug report; it is also what Live Connect announces to Studio |
 
 ### Loading
 
@@ -155,7 +161,7 @@ If a bank or a sample is missing from a build, the addon says so in the log and 
 | `PFA.get_current_node(event) → String` | Current node ID (`""` if none) |
 | `PFA.toggle_sub_level(event, sub_name, enabled, fade := 0.5)` | Toggle a sub-level layer on/off with a fade |
 
-Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers at transition start, and quantizes per cascade `connection.quantize → node.fade_quantize → event.switch_quantization`.
+Node graph activates when the config has `use_nodes: true`. The engine enters the entry node on `play()` (honoring `entry_fade`), auto-advances after `duration_bars × loop_count` when a transition has `auto: true`, falls back to a node's `terminal_fade` when there's no auto transition, fires stingers when the target node is entered (see Musical Timing for the per-kind moment), and quantizes per cascade `connection.quantize → node.fade_quantize → event.switch_quantization`.
 
 ### SFX
 
@@ -185,9 +191,9 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 | `event_started(event_name)` | Music event started |
 | `event_stopped(event_name)` | Event stopped |
 | `level_changed(event_name, level)` | Adaptive level changed — fires when the switch is **applied** (on a `bar`/`beat` quantization that is the boundary, not the `set_level` call) |
-| `sfx_triggered(event_name, played)` | SFX fired — `played` as returned by `trigger()` (empty for spatial one-shots) |
+| `sfx_triggered(event_name, played)` | An SFX **actually fired** — not emitted for a refused trigger (cooldown, voice cap, every chance roll failed). `played` as returned by `trigger()`; `[]` for spatial one-shots (their voices carry no report) |
 | `node_changed(event_name, node_id, node_name)` | Active node changed — fires at the **apply point** with the new node, for manual `navigate()`, auto-advance and deferred fade-out switches alike |
-| `sub_level_toggled(event_name, sub_name, enabled)` | Sub-level toggled |
+| `sub_level_toggled(event_name, sub_name, enabled)` | Sub-level toggle **applied** — not emitted for a no-op (stopped event, unknown sub-level name) |
 | `transition_info(event_name, info)` | Per-phase transition diagnostics — see Transition Info |
 
 ```gdscript
@@ -222,7 +228,7 @@ func _process(_dt):          # each frame
     PFA.set_listener_3d(xf.origin, -xf.basis.z, xf.basis.y)
 ```
 
-The engine owns an internal `AudioListener2D`/`AudioListener3D` (made current on first use) — you feed it positions; it stays independent of your camera setup.
+The engine owns an internal `AudioListener2D`/`AudioListener3D` (made current on first use) — you feed it positions; it stays independent of your camera setup. `set_listener_3d(pos, forward := Vector3(0, 0, -1), up := Vector3(0, 1, 0))` — the orientation arguments default to Godot's forward/up, so a fixed-orientation game can pass the position alone.
 
 ### One-shots at a position
 
@@ -232,19 +238,23 @@ PFA.trigger_spatial_3d("ball_hit", pos.x, pos.y, pos.z)                  # 3D
 PFA.trigger_spatial_3d("ball_hit", pos.x, pos.y, pos.z, {"intensity": 0.8})
 ```
 
-Returns the first spawned voice (`AudioStreamPlayer2D`/`3D`) or `null`. Multi-track events spawn one voice per track.
+Returns the first spawned voice (`AudioStreamPlayer2D`/`3D`) or `null` (unknown event, or the trigger was refused by the cap/cooldown/audibility gate). Multi-track events spawn one voice per track. Formal shapes: `trigger_spatial(event, x, y, config := {}) → Object` and `trigger_spatial_3d(event, x, y, z, config := {}) → Object` — the trailing `config` Dictionary is a per-call spatial override.
 
 ### Emitters — voices that follow a game object
 
 ```gdscript
 var em: PFASpatialEmitter = PFA.create_emitter_3d("ball_roll")   # optional config dict
-em.set_position_3d(ball.x, ball.y, ball.z)    # or set_position_2d — update each frame
+var em2 := PFA.create_emitter_2d("torch")     # 2D twin — same API, x/y positions
+em.set_position_3d(ball.x, ball.y, ball.z)    # or set_position_2d(x, y) — update each frame
 em.trigger()                                  # fire the bound event (loops keep sounding)
 
 # when the object stops / dies:
 em.destroy()        # stops its voices via the event's authored release_fade
 em.destroy(0.0)     # "as fast as click-free allows" (30 ms floor), not a hard cut
+em.destroy(250)     # explicit override — MILLISECONDS (250 = a quarter-second release)
 ```
+
+Reference: `PFA.create_emitter_2d(event, config := {}) → PFASpatialEmitter` and `PFA.create_emitter_3d(event, config := {}) → PFASpatialEmitter` — `null` for an unknown event. On the emitter: `set_position_2d(x, y)` / `set_position_3d(x, y, z)`; `trigger(event_name := "") → Object` fires the bound event (or a named other event at this position) and returns the first voice or `null`; `destroy(fade_ms := -1.0)` — the override is in **milliseconds** (the one fade argument in the API that is not seconds, shared with the JS engine's `destroy(fadeMs)`); `-1` ⇒ the event's authored `release_fade`, and any explicit value is floored at 30 ms.
 
 A looping event (authored `loop {enabled, mode}` in Studio) keeps sounding until `destroy()` — `"seamless"` is a native gapless loop, `"smart"` re-triggers per cycle with fresh variation picks and play-chance rolls, crossfaded over 80 ms.
 
@@ -302,7 +312,7 @@ Studio can author named **reverb zones** (room, cave, hall…) at project level 
 |--------|-------------|
 | `PFA.set_reverb_zone(name, fade := 0.5)` | Switch zones: room character snaps, wet ramps click-free over `fade`. `null`/`""` ⇒ dry |
 | `PFA.get_reverb_zone() → String` | Active zone name (`""` = dry) |
-| `PFA.create_reverb_zone(name, extent, position := Vector3.ZERO, amount := 0.8, uniformity := 0.5) → Area3D` | **Positional 3D reverb** (Godot-only superpower): creates a per-zone bus + `Area3D` box; you parent and place it — 3D spatial voices physically inside get positionally wet, auto-crossfaded by Godot |
+| `PFA.create_reverb_zone(name, extent, position := Vector3.ZERO, amount := 0.8, uniformity := 0.5) → Area3D` | **Positional 3D reverb** (Godot-only superpower): creates a per-zone bus + `Area3D` box; you parent and place it — 3D spatial voices physically inside get positionally wet, auto-crossfaded by Godot. Returns `null` when the zone name is unknown or the pack authors no reverb zones — check before parenting |
 
 ### Honest caveats (know before you mix)
 
@@ -348,6 +358,20 @@ func _on_pack_reloaded():
 - Handled editor commands: `reload`, `set_volume`, `set_level`, `play`, `stop`, `trigger`, `set_group_volume`, `set_master_volume`, `set_mute`, `duck`, `unduck`.
 - Reload flow: `stop_all(0.5)` → 0.6 s settle → `load_pack(PFA.pack_path)` → `pack_reloaded`. If you loaded from a bank, set `PFA.pack_path` to the loose `config.json` so Sync reloads pick up fresh exports.
 
+`PFALive` reference:
+
+| Member | Description |
+|--------|-------------|
+| `connect_to_editor(to_port := -1)` | Start connecting; `-1` ⇒ `DEFAULT_PORT`. Auto-reconnects every `RECONNECT_DELAY` seconds until told otherwise |
+| `disconnect_from_editor()` | Deliberate disconnect — closes the socket and stops the auto-reconnect loop |
+| `status_changed(connected: bool)` *(signal)* | Editor link went up / down |
+| `pack_reloaded` *(signal)* | The pack was re-read from disk after a Studio Sync — rebuild what you own |
+| `log_message(msg: String)` *(signal)* | The node's status lines as a signal — fires even when `PFA.debug_logs` is off, for the game's own console/overlay |
+| `ENGINE_VERSION` | Derived from `PFA.VERSION` at parse time — always equal to it; rides the Live `hello` payload |
+| `DEFAULT_PORT` = `9264` | Studio's Live server port |
+| `RECONNECT_DELAY` = `5.0` | Seconds between reconnect attempts |
+| `RELOAD_SETTLE` = `0.6` | Seconds the reload flow waits after `stop_all(0.5)` before re-reading the pack |
+
 ---
 
 ## Musical Timing & Transitions
@@ -359,7 +383,7 @@ How the engine performs music (all authored in Studio; nothing here needs game c
 - **Transition kinds**: per-connection `kind` — `crossfade` (default), `fade_in` (silence others, ramp target from 0), `fade_out` (ramp all to silence, then a deferred switch; superseding transitions cancel it). Exporter-flattened `fade_out → fade_in` chains carry `entry_fade_duration/curve`, and the engine ramps the new level from 0 instead of hard-cutting.
 - **Fade curves**: `linear`, `equal_power` (default), `s_curve`, `exponential`, `logarithmic` — one shared curve implementation across every fade path, same math as the JS engine.
 - **Tempo & phase**: per-node `bpm` / `time_signature` update the conductor on entry; `free_tempo` nodes disable quantization (auto-advance falls back to `clip_length × loop_count`); `restart_on_entry: true` resets phase on entry via `seek(0)` (variation pick preserved).
-- **Stingers**: a one-shot bundle on a transition, fired at the **start** of the fade (t=0 — covering transients short crossfades would eat), picker `random` / `weighted` / `no_repeat` with independent history per connection. No separate API — a side effect of transitions.
+- **Stingers**: a one-shot bundle on a transition, fired when the **target node is entered**. For `crossfade` and `fade_in` that is the start of the fade (t=0 — covering transients short crossfades would eat); a `fade_out → fade_in` chain enters the target after the exit ramp, so its stinger rides the fade-in half (Studio doesn't author stingers on plain fade-out transitions). Picker `random` / `weighted` / `no_repeat` with independent history per connection. No separate API — a side effect of transitions.
 
 ### Transition Info
 
@@ -384,6 +408,7 @@ Every start/stop/switch path has a floor — `0` always means "as fast as click-
 | Path | Protection |
 |------|-----------|
 | Level ramps / variation switch | 30 ms floor (`_MICRO_FADE_SEC`) |
+| Event-level fades — `stop` / `crossfade_to` / `fade_out` / duck | 30 ms floor (`_MICRO_FADE_SEC`), explicit `0` included |
 | Spatial voice release (incl. `destroy(0)`, voice steal) | 30 ms floor (`_STOP_FLOOR_SEC`) |
 | Non-spatial SFX voice stop | 20 ms floor |
 | Smart-loop cycle seam | 80 ms crossfade |
@@ -394,13 +419,15 @@ The JS engine's floors are shorter (10–20 ms) because Web Audio schedules samp
 
 ## Versions & Compatibility
 
-This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.15.x — the numbers are not aligned by design). The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon, provided the export uses an audio format the addon decodes (OGG / MP3 / WAV — see Audio Formats).
+This addon versions independently from the rest of the suite (Studio 0.9.x, JS engine 1.16.x — the numbers are not aligned by design). Ask the running addon which one it is with `PFA.VERSION`. The compatibility contract is the **config schema v1.1**: any PFA Studio 0.9.x export plays on this addon, provided the export uses an audio format the addon decodes (OGG / MP3 / WAV — see Audio Formats).
 
 ## License
 
-**This addon is MIT** — free for commercial and personal use, no attribution required.
+<!-- This paragraph is a mechanical copy of the LICENSING block in the AssetLib
+     listing (the canonical text) — word-for-word, pinned by a copy check in
+     the release pipeline. Edit them together or not at all. -->
 
-It plays packs authored in **PFA Studio**, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding are under USD $200,000; at or above that, beta builds stay free until a release version ships plus a 60-day transition, then commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON `config.json` next to the audio files, or a single `.pfabank` container carrying that same JSON plus the audio — the addon reads either, whatever produced it.
+This addon is MIT — use it in any project, commercial or not; no in-game credit required, just keep the MIT license file with the code. It plays packs authored in PFA Studio, a separate desktop application with its own license. The Studio beta is free for everyone. For commercial projects it stays free while your total annual gross revenue and funding stay under USD $200,000 — counted across a company and any group it belongs to, and across games and other interactive projects for individuals. At or above that threshold, and for all casino products regardless of revenue, beta builds stay free until a release version ships plus a 60-day transition; after that, commercial use needs a release license. Beta builds are never remotely disabled, and whatever you make with the Studio stays yours in all cases (full terms in the Studio EULA). The pack format is open: a plain-JSON config.json next to the audio files, or a single .pfabank container carrying that same JSON plus the audio — the addon reads either, whatever produced it.
 
 - Website: [pitchfoxaudio.com](https://pitchfoxaudio.com)
 - Support the project: [Buy Me a Coffee](https://buymeacoffee.com/pitchfoxaudio)

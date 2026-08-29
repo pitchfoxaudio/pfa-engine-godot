@@ -14,6 +14,20 @@ extends Node
 ##   PFA.load_group("Room1")
 ##   PFA.unload_group("Room1")
 
+# --- Identity ---
+
+## The addon's release, readable from any game script as `PFA.VERSION` — the
+## twin of the web engine's `PFA.VERSION`. THE single literal: `plugin.cfg` is
+## data Godot reads and `PFALive.ENGINE_VERSION` derives from this line, so the
+## version announced over Live Connect can never fall behind the addon.
+const VERSION := "0.11.6"
+
+## Highest config-schema minor this addon implements (the "Versions &
+## Compatibility" contract is schema v1.1). `_config_refusal` refuses a newer
+## minor BEFORE any state commit — that is what keeps the README's "whatever was
+## loaded before keeps playing" true for a config from a future Studio.
+const _SCHEMA_MINOR_MAX := 1
+
 # --- Signals ---
 
 signal event_started(event_name: String)
@@ -70,8 +84,17 @@ static func _config_refusal(data: Variant) -> String:
 	var cfg: Dictionary = data
 	if cfg.has("version"):
 		var ver: String = str(cfg["version"])
-		if ver.split(".")[0] != "1":
+		var parts: PackedStringArray = ver.split(".")
+		if parts[0] != "1":
 			return "config schema %s is not supported (this engine implements 1.x)" % ver
+		# The major alone let a future 1.x minor through, and load_pack
+		# then committed it over the working pack. JS parity: _configRefusal.
+		if parts.size() > 1:
+			var minor: String = parts[1]
+			if not minor.is_valid_int():
+				return "config schema %s is not supported (this engine implements 1.x)" % ver
+			if minor.to_int() > _SCHEMA_MINOR_MAX:
+				return "config schema %s is newer than this addon (supports up to 1.%d) — update the addon" % [ver, _SCHEMA_MINOR_MAX]
 	elif not cfg.has("events"):
 		return "not a PFA pack (neither \"version\" nor \"events\")"
 	if cfg.has("events") and not (cfg["events"] is Dictionary):
@@ -252,8 +275,11 @@ func toggle_sub_level(event_name: String, sub_name: String, enabled: bool, fade:
 	var event = _get_event(event_name)
 	if event == null:
 		return
-	event.toggle_sub_level(sub_name, enabled, fade)
-	sub_level_toggled.emit(event_name, sub_name, enabled)
+	# Outcome signal: the delegate answers whether the toggle was
+	# actually applied — a stopped event or an unknown sub-level is a no-op and
+	# must not be announced as "toggled".
+	if event.toggle_sub_level(sub_name, enabled, fade):
+		sub_level_toggled.emit(event_name, sub_name, enabled)
 
 ## Get current node ID for a node-graph event.
 func get_current_node(event_name: String) -> String:
@@ -395,7 +421,11 @@ func trigger(event_name: String, options: Dictionary = {}) -> Array:
 		return []
 
 	var played: Array = event.trigger_sfx(options)
-	sfx_triggered.emit(event_name, played)
+	# Outcome signal: `sfx_triggered` means an SFX fired. A refused
+	# trigger — cooldown, cap, every chance roll failed — is not an outcome: the
+	# caller sees the [] and listeners hear nothing.
+	if not played.is_empty():
+		sfx_triggered.emit(event_name, played)
 	return played
 
 ## Set the adaptive level for an event (e.g. calm=0, action=1).
@@ -518,7 +548,10 @@ func trigger_spatial(event_name: String, x: float, y: float, config: Dictionary 
 	if event == null:
 		return null
 	var voice = _spatial.trigger_spatial_2d(event, x, y, config)
-	sfx_triggered.emit(event_name, [])
+	# Emits only when a voice actually spawned. The payload stays
+	# `[]` — spatial voices carry no report (the round-05 parity shape).
+	if voice != null:
+		sfx_triggered.emit(event_name, [])
 	return voice
 
 ## Trigger a spatial SFX at a 3D position. Returns the first voice, or null.
@@ -528,7 +561,8 @@ func trigger_spatial_3d(event_name: String, x: float, y: float, z: float, config
 	if event == null:
 		return null
 	var voice = _spatial.trigger_spatial_3d(event, x, y, z, config)
-	sfx_triggered.emit(event_name, [])
+	if voice != null:
+		sfx_triggered.emit(event_name, [])
 	return voice
 
 ## Create a persistent 2D spatial emitter for a moving object: set its position + trigger it,

@@ -131,11 +131,11 @@ var current_node: String = ""
 var _auto_advance_timer: SceneTreeTimer = null
 var _pending_level_switch: SceneTreeTimer = null
 var _pending_node_transition: SceneTreeTimer = null
-var _fade_out_timer: SceneTreeTimer = null
+var _fade_out_gen: int = 0   # cancel/supersede token for fade_out's teardown (see _after_ramp)
 # Transition Kinds v2: fade_out → timer for deferred instant-switch to target
 # after OLD finishes fading. Editor analogue: its deferred navigate.
 # Gates auto-advance during the exit fade window.
-var _pending_fade_out_switch: SceneTreeTimer = null
+var _pending_switch_gen: int = 0   # cancel/supersede token for the deferred level switch (see _after_ramp)
 
 # Generation token guarding stop_playback()'s deferred player teardown against a
 # start_playback() landing inside the 25 ms anti-click window (replay race).
@@ -397,10 +397,8 @@ func stop_playback() -> void:
 		_pending_level_switch = null
 	if _pending_node_transition:
 		_pending_node_transition = null
-	if _fade_out_timer:
-		_fade_out_timer = null
-	if _pending_fade_out_switch:
-		_pending_fade_out_switch = null
+	_fade_out_gen += 1   # cancels an in-flight fade_out teardown (was: _fade_out_timer = null)
+	_pending_switch_gen += 1   # cancels an in-flight deferred switch (was: _pending_fade_out_switch = null)
 
 	_stop_conductor()
 	_level_phase_anchors.clear()
@@ -418,7 +416,7 @@ func stop_playback() -> void:
 	# (web is click-free via sample-accurate gain ramps; Godot's per-frame volume_db cannot
 	# ramp per-sample, so it must WAIT for the ramp instead of racing it).
 	var stop_fade: float = _MICRO_FADE_SEC
-	_tween_event_gain(0.0, stop_fade)
+	var stop_ramp: Tween = _tween_event_gain(0.0, stop_fade)
 
 	var tracks_ref := tracks
 	# Capture the instance ID (int), not the object: the event can be freed inside the
@@ -428,8 +426,21 @@ func stop_playback() -> void:
 	var self_id := get_instance_id()
 	_stop_gen += 1
 	var stop_gen := _stop_gen
-	var t := get_tree().create_timer(stop_fade + 0.04)
-	t.timeout.connect(func():
+	# CONNECT_ONE_SHOT on EVERY timeout in this file.
+	# A SceneTreeTimer dies by refcount, and its own timeout
+	# connection keeps it — and this script — referenced after the emit; nothing ever
+	# disconnects it, because the timer was supposed to be garbage by then. Measured:
+	# five live SceneTreeTimers per play/stop pair, unchanged 25 s into silence and
+	# linear in the number of pairs, plus `Resource still in use: pfa_event.gd`. The
+	# timers had all FIRED — this is not an uncancelled timer, and no amount of
+	# nulling the reference reaches it. One-shot drops the connection at emit and the
+	# timer is freed the moment SceneTree lets go. Applies to `timeout` only: a
+	# player's `finished` may fire again on a reused voice and must stay connected.
+	# The margin rides _after_ramp, which starts it only once the ramp reported
+	# silence — the "WAIT for the ramp instead of racing it" the block comment above
+	# always meant. A bare create_timer(stop_fade + 0.04) raced it, and lost on any
+	# frame longer than the margin.
+	_after_ramp(stop_ramp, 0.04, func():
 		var ev = instance_from_id(self_id)
 		if ev == null:
 			return
@@ -557,14 +568,14 @@ func navigate(trigger: String) -> bool:
 	return false
 
 ## Toggle sub-level on/off with fade. JS: toggleSubLevel()
-func toggle_sub_level(sub_name: String, enabled: bool, fade_dur: float = 0.5) -> void:
+func toggle_sub_level(sub_name: String, enabled: bool, fade_dur: float = 0.5) -> bool:
 	if not is_playing:
-		return
+		return false
 	var key: String = "%d_%s" % [current_level, sub_name]
 	var sub: Dictionary = _sub_level_tracks.get(key, {})
 	if sub.is_empty():
 		push_warning("[PFA] Sub-level \"%s\" not found for level %d" % [sub_name, current_level])
-		return
+		return false
 
 	if enabled:
 		_enable_sub_level(sub, fade_dur)
@@ -574,6 +585,7 @@ func toggle_sub_level(sub_name: String, enabled: bool, fade_dur: float = 0.5) ->
 	if not _sub_level_states.has(sub_name):
 		_sub_level_states[sub_name] = {}
 	_sub_level_states[sub_name]["enabled"] = enabled
+	return true
 
 ## Fade in (for crossfade between events). JS: fadeIn()
 func fade_in(duration: float, curve: String = "equal_power") -> void:
@@ -607,17 +619,19 @@ func stop_with_terminal_fade() -> bool:
 
 ## Fade out and stop. JS: fadeOut()
 func fade_out(duration: float, curve: String = "equal_power") -> void:
-	_tween_event_gain(0.0, duration, curve)
-	var fo_timer: SceneTreeTimer = get_tree().create_timer(duration)
-	_fade_out_timer = fo_timer
+	var ramp: Tween = _tween_event_gain(0.0, duration, curve)
+	# Generation, not the old SceneTreeTimer identity: the ramp is the clock now
+	# (_after_ramp), and on the duration<=0 path there is no ramp object to be
+	# identified by. Bumping the counter is what "cancel" means for both paths.
+	_fade_out_gen += 1
+	var gen: int = _fade_out_gen
 	var self_id := get_instance_id()   # int capture — freed-object captures print errors
-	fo_timer.timeout.connect(func():
+	_after_ramp(ramp, 0.0, func():
 		var ev = instance_from_id(self_id)
 		if ev == null:
 			return
-		if ev._fade_out_timer != fo_timer:
+		if ev._fade_out_gen != gen:
 			return  # superseded by a newer fade_out or cancelled by stop (JS clearTimeout parity; play() deliberately does NOT cancel — same as web)
-		ev._fade_out_timer = null
 		if ev.is_playing:
 			ev.stop_playback()
 	)
@@ -733,8 +747,7 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 func _apply_node_transition(node_id: String, node: Dictionary, target_level: int,
 		fd: float, fc: String, fade_settings: Dictionary) -> void:
 	# Any in-flight fade_out deferred switch is superseded by this new transition.
-	if _pending_fade_out_switch:
-		_pending_fade_out_switch = null
+	_pending_switch_gen += 1   # cancels an in-flight deferred switch (was: _pending_fade_out_switch = null)
 
 	# Invalidate any pending per-level scheduled timers (variation swap, chance gain)
 	# that were captured under the pre-transition state. Without this, an OLD-level
@@ -810,6 +823,7 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 		_auto_advance_timer = null
 
 	var exit_curve: String = str(fade_settings.get("fade_curve", "equal_power"))
+	var exit_ramp: Tween = null
 	# Fade every currently-audible level on every per-level track down to 0 over fd.
 	# We don't know which levels are actually audible, so fade them all; silent ones
 	# stay silent (ramp has no effect) and the one(s) that were playing fade out.
@@ -818,7 +832,9 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 			continue
 		var level_map: Dictionary = _track_players.get(track.name, {})
 		for lvl in level_map:
-			_ramp_level_gain(track, int(lvl), 0.0, fd, exit_curve)
+			var tw: Tween = _ramp_level_gain(track, int(lvl), 0.0, fd, exit_curve)
+			if tw != null:
+				exit_ramp = tw   # same fd, same frame — they land together
 
 	var captured_id := node_id
 	var captured_node := node
@@ -828,18 +844,20 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 	var entry_fd: float = float(fade_settings.get("entry_fade_duration", 0.0))
 	var entry_curve: String = str(fade_settings.get("entry_fade_curve", "equal_power"))
 
-	# Small buffer (5 ms) after fade_end to ensure the ramp fully resolved before we
-	# retrigger gains. Matches editor's "fade_end then switch" pattern.
-	var switch_timer: SceneTreeTimer = get_tree().create_timer(fd + 0.005)
-	_pending_fade_out_switch = switch_timer
+	# Small buffer (5 ms) after the ramp resolves, before we retrigger gains. Matches
+	# editor's "fade_end then switch" pattern. The buffer follows the RAMP, not a
+	# create_timer(fd + 0.005) running beside it: 5 ms is thinner than one frame, so
+	# the old form fired ahead of the ramp routinely, and a short fd under a long
+	# frame let the switch land on a level still at full gain.
+	_pending_switch_gen += 1
+	var gen: int = _pending_switch_gen
 	var self_id := get_instance_id()   # int capture — freed-object captures print errors
-	switch_timer.timeout.connect(func():
+	_after_ramp(exit_ramp, 0.005, func():
 		var ev = instance_from_id(self_id)
 		if ev == null:
 			return
-		if ev._pending_fade_out_switch != switch_timer:
-			return  # cancelled OR superseded — a second fade_out re-arms the var, so a bare null-check let the stale switch through
-		ev._pending_fade_out_switch = null
+		if ev._pending_switch_gen != gen:
+			return  # cancelled OR superseded — a second fade_out re-arms the counter, so a bare null-check let the stale switch through
 		if not ev.is_playing:
 			return
 		# Current_level is about to flip to target. Bump gen so any pending swap/
@@ -947,7 +965,7 @@ func _schedule_node_transition(node_id: String, node: Dictionary, target_level: 
 		if not ev.is_playing: return
 		ev._apply_node_transition(captured_id, captured_node, captured_level, captured_fd, captured_fc, captured_fs)
 		_dlog("[PFA] Quantized node transition applied")
-	)
+	, CONNECT_ONE_SHOT)
 
 ## JS: _executeTransition(connection)
 func _execute_transition(connection: Dictionary) -> void:
@@ -1035,7 +1053,7 @@ func _schedule_auto_advance(node: Dictionary) -> void:
 			ev._execute_auto_advance()
 		else:
 			ev.stop_with_terminal_fade()
-	)
+	, CONNECT_ONE_SHOT)
 
 ## JS: _executeAutoAdvance()
 func _execute_auto_advance() -> void:
@@ -1186,7 +1204,7 @@ func _schedule_next_bar_tick() -> void:
 		ev._bar_counter += 1
 		ev._conductor_tick()
 		ev._schedule_next_bar_tick()
-	)
+	, CONNECT_ONE_SHOT)
 
 ## JS: _stopConductor()
 func _stop_conductor() -> void:
@@ -1368,7 +1386,7 @@ func _apply_chance_gain(track: PFATrack, level: int, playing: bool, when_time: f
 			if captured_gen != ev._transition_gen: return
 			if captured_level != ev.current_level: return
 			ev._ramp_level_gain(captured_track, captured_level, captured_amp, captured_fade)
-		)
+		, CONNECT_ONE_SHOT)
 	else:
 		_ramp_level_gain(track, level, target_amp, fade_sec)
 
@@ -1409,7 +1427,7 @@ func _switch_variation(track: PFATrack, level: int, is_shared: bool, boundary_ti
 			var ev = instance_from_id(self_id)
 			if ev != null:
 				ev._apply_variation_switch(captured_track, captured_level, captured_shared)
-		)
+		, CONNECT_ONE_SHOT)
 	else:
 		_apply_variation_switch(track, level, is_shared)
 
@@ -1648,19 +1666,22 @@ func _activate_level(track: PFATrack, target_level: int, fd: float,
 ## Tween the active player of (track, level) to new target amp over fd seconds.
 ## Splice: read current volume_db, kill old tween, start new from actual current amp.
 ## `curve` shapes the ramp (editor parity). Default preserves prior equal_power behavior.
+## Returns the ramp it started, or null when it made none (nothing to ramp, or the
+## amp was already at target and the write was instant). Callers that must act
+## AFTER the ramp hand it to _after_ramp — never to a timer sized to guess it.
 func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
-		curve: String = "equal_power") -> void:
+		curve: String = "equal_power") -> Tween:
 	var level_map: Dictionary = _track_players.get(track.name, {})
 	var state: Dictionary = level_map.get(level, {})
 	if state.is_empty():
-		return
+		return null
 	var players: Array = state.get("players", [])
 	var active: int = state.get("active", 0)
 	if active < 0 or active >= players.size():
-		return
+		return null
 	var player: AudioStreamPlayer = players[active]
 	if not is_instance_valid(player):
-		return
+		return null
 
 	# Kill previous tween on this level.
 	var lvl_state_map: Dictionary = _track_level_state.get(track.name, {})
@@ -1691,7 +1712,7 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 				"curve": curve,
 			}
 			_track_level_state[track.name] = lvl_state_map
-			return
+			return null
 
 	var start_amp: float = _current_amp_of_player(player)
 	var tween: Tween = _equal_power_tween_to_amp(player, target_amp, fd, curve)
@@ -1701,6 +1722,7 @@ func _ramp_level_gain(track: PFATrack, level: int, target_amp: float, fd: float,
 		"curve": curve,
 	}
 	_track_level_state[track.name] = lvl_state_map
+	return tween
 
 ## Fade-in curve shape 0→1 for given progress ∈ [0,1]. Editor parity:
 ## the editor's _get_fade_value. Callers use f(1-p) for fade-out semantics
@@ -1880,7 +1902,7 @@ func _schedule_level_switch(level: int, when_time: float) -> void:
 		ev._crossfade_level(old_level, captured_level)
 		_dlog("[PFA] Quantized setLevel: %d → %d" % [old_level, captured_level])
 		ev.level_applied.emit(captured_level)
-	)
+	, CONNECT_ONE_SHOT)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1943,19 +1965,23 @@ func _disable_sub_level(_sub: Dictionary, sub_name: String, fade_dur: float) -> 
 	if state.is_empty():
 		return
 	var players: Array = state.get("players", [])
+	# Teardown must OUTLAST the ramp, and it is the RAMP that says
+	# when, not a timer sized to guess it: the effective-fade arithmetic this block
+	# used to carry (floor a sub-floor fade_dur to _MICRO_FADE_SEC, then add a render
+	# margin) only ever approximated "after the tween", and lost outright on a frame
+	# longer than the margin — twice before, each time answered by widening it
+	# ("a raw fade_dur+0.01 fired mid-ramp at an audible level"). The floor lives
+	# inside _equal_power_tween_to_amp, where it belongs; the tween's own `finished`
+	# is exact.
+	var ramp: Tween = null
 	for p in players:
 		if is_instance_valid(p):
-			_equal_power_tween_to_amp(p, 0.0, fade_dur)
-	# Teardown must OUTLAST the ramp (micro-fade contract): the tween floors a sub-floor
-	# fade_dur to _MICRO_FADE_SEC internally, so size the timer from the EFFECTIVE fade
-	# + the render margin — a raw fade_dur+0.01 fired mid-ramp at an audible level.
-	var eff_fade: float = fade_dur
-	if eff_fade > 0.0 and eff_fade < _MICRO_FADE_SEC:
-		eff_fade = _MICRO_FADE_SEC
-	var timer: SceneTreeTimer = get_tree().create_timer(eff_fade + 0.04)
+			var tw: Tween = _equal_power_tween_to_amp(p, 0.0, fade_dur)
+			if tw != null:
+				ramp = tw   # same duration, same frame — they finish together
 	var captured_players := players
 	var self_id := get_instance_id()   # int capture — freed-object captures print errors
-	timer.timeout.connect(func():
+	_after_ramp(ramp, 0.04, func():
 		var ev = instance_from_id(self_id)
 		for p in captured_players:
 			if is_instance_valid(p):
@@ -1975,13 +2001,15 @@ func _stop_all_sub_levels_immediate() -> void:
 	for sub_name in _sub_level_states.keys():
 		var state: Dictionary = _sub_level_states[sub_name]
 		var players: Array = state.get("players", [])
+		var ramp: Tween = null
 		for p in players:
 			if is_instance_valid(p):
-				_equal_power_tween_to_amp(p, 0.0, _MICRO_FADE_SEC)
+				var tw: Tween = _equal_power_tween_to_amp(p, 0.0, _MICRO_FADE_SEC)
+				if tw != null:
+					ramp = tw
 		var captured := players
-		var timer: SceneTreeTimer = get_tree().create_timer(_MICRO_FADE_SEC + 0.04)
 		var self_id := get_instance_id()   # int capture — freed-object captures print errors
-		timer.timeout.connect(func():
+		_after_ramp(ramp, 0.04, func():
 			var ev = instance_from_id(self_id)
 			for p in captured:
 				if is_instance_valid(p):
@@ -2332,7 +2360,7 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 					player.stop()
 					player.queue_free()
 				_sfx_voices.erase(player)
-			)
+			, CONNECT_ONE_SHOT)
 			stop_t.start()
 
 	if delay_ms > 0.0:
@@ -2340,7 +2368,7 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 		delay_t.one_shot = true
 		delay_t.wait_time = delay_ms / 1000.0
 		player.add_child(delay_t)
-		delay_t.timeout.connect(start_cb)
+		delay_t.timeout.connect(start_cb, CONNECT_ONE_SHOT)
 		delay_t.start()
 	else:
 		start_cb.call()
@@ -2462,16 +2490,67 @@ func _set_event_gain_amp(amp: float) -> void:
 	_event_gain_amp = amp
 	_apply_event_gain_to_all_active()
 
-## Tween event gain to target over duration. Kills previous tween.
+## Run `done` once the ramp that actually moves the audio has finished, plus the
+## render margin the caller needs.
+##
+## NEVER pair a fade with a SceneTreeTimer sized to the fade's duration.
+##
+## The mechanism, measured rather than assumed — Godot 4.7-stable headless at
+## physics_ticks_per_second=60, and re-measured on 4.6.3:
+##
+##   - A SceneTreeTimer is decremented by the delta of the frame that FOLLOWS
+##     its creation, and a long frame (a scene change, a pack decode, startup)
+##     hands over a CLAMPED delta: 0.115-0.163 s here, 0.130 s on 4.6.3. That
+##     number is not a property of the engine — it scales with the project's
+##     physics settings (0.316 s at 30 ticks/s), so quote it with the version
+##     and the project it came from, or not at all.
+##   - The Tween created in the same frame takes that clamped delta TOO. An
+##     earlier version of this comment said it did not; on 4.7 and on 4.6.3 it
+##     does, and the two clocks land within a few ms of each other.
+##
+## What is unsafe is the ORDER inside the frame where both expire: the timer's
+## `timeout` is emitted BEFORE the tween's step for that frame, so a teardown
+## sized `fade + margin` reads the ramp mid-flight and stops/frees at an audible
+## gain — a click. Measured on 4.7 with a 30 ms fade: a 120 ms frame tore down
+## at gain 0.7685, and with NO long frame at all it still tore down at 0.0741,
+## because a fade that short expires in the timer's own frame regardless. The
+## long frame widens the window; it does not create it.
+##
+## First seen as a property of one test runner's scheduling; it is a property
+## of the primitive, and every fade in this file used to be exposed to it.
+##
+## The margin still rides a timer, and that one is safe by construction: it only
+## starts AFTER the ramp reached silence, and the only thing that can collapse it
+## is wall time the audio thread already spent rendering that silence.
+func _after_ramp(ramp: Tween, margin: float, done: Callable) -> void:
+	if ramp != null and ramp.is_valid():
+		var m: float = margin
+		ramp.finished.connect(func():
+			if m <= 0.0:
+				done.call()
+			else:
+				get_tree().create_timer(m).timeout.connect(done, CONNECT_ONE_SHOT)
+		, CONNECT_ONE_SHOT)
+		return
+	# No ramp: the tween died with its player before the caller could hand it over
+	# (a zero duration no longer produces null — _tween_event_gain floors it to the
+	# anti-click ramp). Nothing is ramping, so nothing can be torn down early — keep
+	# the one-frame deferral the timer used to give, which call sites rely on.
+	get_tree().create_timer(margin).timeout.connect(done, CONNECT_ONE_SHOT)
+
+## Tween event gain to target over duration (floored to _MICRO_FADE_SEC, zero
+## included — never returns null). Kills previous tween.
 ## `curve` (editor parity): linear / equal_power / s_curve / exponential / logarithmic.
-func _tween_event_gain(target: float, duration: float, curve: String = "equal_power") -> void:
+func _tween_event_gain(target: float, duration: float, curve: String = "equal_power") -> Tween:
 	if _event_gain_tween and _event_gain_tween.is_valid():
 		_event_gain_tween.kill()
-	if duration <= 0.0:
-		_set_event_gain_amp(target)
-		return
 	# Anti-click frame-rate floor: Godot writes volume_db once per game frame (~16.7ms),
 	# so a sub-2-frame fade renders as a step → click. Mirrors _ramp_level_gain's floor.
+	# `0` takes the floor too: the public contract is "0 means as fast
+	# as click-free allows, never a hard cut", and an instant assignment on a live
+	# waveform is that hard cut — crossfade_to(ev, 0) shipped one. A caller that
+	# needs a genuinely instant set (fresh-start gain init before the sources play)
+	# uses _set_event_gain_amp directly and never rode this path.
 	if duration < _MICRO_FADE_SEC:
 		duration = _MICRO_FADE_SEC
 	var start_amp: float = _event_gain_amp
@@ -2492,6 +2571,7 @@ func _tween_event_gain(target: float, duration: float, curve: String = "equal_po
 		_event_gain_amp = v
 		_apply_event_gain_to_all_active()
 	, 0.0, 1.0, duration)
+	return _event_gain_tween
 
 ## Walk every active per-(track, level) and shared player — update volume_db with new event gain.
 ## This does NOT kill level tweens; it instead scales the tween's own output by updating
@@ -2695,7 +2775,7 @@ func _schedule_clip_wrap(player_id: int, state: Dictionary) -> void:
 			var pos_in_clip: float = fmod(ev._now() - float(st["anchor"]), float(st["len"]))
 			player.seek(float(st["offset"]) + pos_in_clip)
 		ev._schedule_clip_wrap(player_id, st)
-	)
+	, CONNECT_ONE_SHOT)
 
 ## Total frame count of a WAV stream — the correct LOOP_FORWARD loop_end.
 ## AudioStreamWAV loop points are in FRAMES; loop_end = 0 is NOT "end of data"
