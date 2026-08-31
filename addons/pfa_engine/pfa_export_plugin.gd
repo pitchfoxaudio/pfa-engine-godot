@@ -13,6 +13,12 @@ extends EditorExportPlugin
 ## This plugin closes it: every bank in the project is added to the export. Set the
 ## project setting `pfa_engine/export/include_pfabank = false` to opt out (a project
 ## that ships loose packs only, or one that lists banks in the export filter itself).
+##
+## It also ships the addon's MIT notice. The LICENSE file is not a
+## resource either, so a stock export stored every addon script and zero notice
+## bytes — making the README's "keep the notice with copies" impossible to satisfy
+## by default. The notice rides along the same way the banks do; the bank opt-out
+## does not touch it.
 
 const SETTING := "pfa_engine/export/include_pfabank"
 const BANK_EXT := PFAEvent.BANK_EXTENSION
@@ -27,6 +33,7 @@ func _get_name() -> String:
 
 
 func _export_begin(_features: PackedStringArray, _is_debug: bool, _path: String, _flags: int) -> void:
+	_add_license_notice()
 	if ProjectSettings.has_setting(SETTING) and not bool(ProjectSettings.get_setting(SETTING)):
 		return
 	var banks: Array[String] = []
@@ -59,6 +66,31 @@ func _export_begin(_features: PackedStringArray, _is_debug: bool, _path: String,
 		total += bytes.size()
 	if added > 0:
 		print("[PFA] Added %d .pfabank file(s) to the export, %.1f MB" % [added, total / 1048576.0])
+
+
+## The MIT notice travels in every build. A LICENSE file has no
+## extension, so it is never a resource and never exported on its own; this puts
+## the exact bytes into the PCK at the addon's own path. The preset's filters are
+## honored the same way the bank pass honors them: a copy the author already
+## ships (include filter) is not doubled, an exclusion is respected as a
+## deliberate choice.
+func _add_license_notice() -> void:
+	const NOTICE_PATH := "res://addons/pfa_engine/LICENSE"
+	var include_globs: PackedStringArray = PackedStringArray()
+	var exclude_globs: PackedStringArray = PackedStringArray()
+	var preset: EditorExportPreset = get_export_preset()
+	if preset != null:
+		include_globs = _split_filter(preset.get_include_filter())
+		exclude_globs = _split_filter(preset.get_exclude_filter())
+	if _matches_any(NOTICE_PATH, exclude_globs):
+		return  # the author excluded it on purpose
+	if _matches_any(NOTICE_PATH, include_globs):
+		return  # the preset already ships it
+	var bytes: PackedByteArray = FileAccess.get_file_as_bytes(NOTICE_PATH)
+	if bytes.is_empty():
+		push_warning("[PFA] Addon LICENSE missing at %s — the MIT notice will not ship in this build" % NOTICE_PATH)
+		return
+	add_file(NOTICE_PATH, bytes, false)
 
 
 ## Export filters are one comma-separated glob list, the way the export dialog stores them.
