@@ -129,6 +129,13 @@ var use_nodes: bool = false
 var _node_graph_data: Dictionary = {}
 var current_node: String = ""
 var _auto_advance_timer: SceneTreeTimer = null
+## The authored endpoint of the current section's repeats (wall-clock seconds):
+## entry + duration_bars × loop_count bars. The timer that reaches it fires a
+## frame late; the route it chooses quantizes against THIS moment, and the next
+## section counts its repeats from it — so a chain of automatic sections holds
+## the grid instead of drifting by the timers' lateness. -1 = none scheduled.
+## JS parity: `_autoAdvanceAt`.
+var _auto_advance_at: float = -1.0
 var _pending_level_switch: SceneTreeTimer = null
 var _pending_node_transition: SceneTreeTimer = null
 var _fade_out_gen: int = 0   # cancel/supersede token for fade_out's teardown (see _after_ramp)
@@ -178,6 +185,13 @@ var _group_mute: bool = false
 var _bank_loader: PFABankLoader = null
 var _samples_loaded: bool = false
 var _play_start_time: float = 0.0
+## Origin of the bar grid (`_calc_next_bar_boundary` / `_calc_next_beat_boundary`
+## count bars from here at the CURRENT bar length). It is the play start until
+## the bar length changes — a section carrying a Tempo node starts its own grid
+## at the moment it is entered (`_sync_bar_duration_to_current_node`). A
+## same-tempo section entered mid-bar keeps the grid the event plays on.
+## JS parity: `_barGridAnchor`.
+var _bar_grid_anchor: float = 0.0
 ## −∞ epoch, NOT 0.0: ticks start at process launch, so a 0.0 init silently muted
 ## any event whose cooldown_ms exceeded the game's uptime at first trigger
 ## (uptime − 0 < cooldown). Found when a first trigger landed inside cooldown.
@@ -241,6 +255,13 @@ var _transition_gen: int = 0
 
 ## SFX voice list for max_instances tracking: [AudioStreamPlayer]
 var _sfx_voices: Array = []
+## Smart-loop controllers of flat voices (one per looping track per trigger):
+## { stopped, active, track, iv }. A controller re-triggers its track one clip
+## cycle later and dies with its voice. See _start_flat_smart_loop.
+var _flat_smart_ctrls: Array = []
+## The smart seam: the next pass rises from silence over this while the last
+## one is released over the same window (pfa_spatial's _SMART_CROSS, JS 80 ms).
+const _SMART_CROSS_SEC: float = 0.08
 
 ## Spatial voices of THIS event (AudioStreamPlayer2D|3D), registered by
 ## PFASpatial._spawn_voice and unregistered by its _free_voice — so the
@@ -296,6 +317,7 @@ func start_playback() -> void:
 		# while the active level tries to crossfade. Let the normal transition
 		# path below handle the audible ramp instead.
 		_play_start_time = _now()
+		_bar_grid_anchor = _play_start_time
 		var entry_fade_dur: float = 0.02
 		var entry_fade_curve: String = "equal_power"
 		var node_owns_entry: bool = false
@@ -378,6 +400,7 @@ func _find_connection_fade(src: String, tgt: String) -> Dictionary:
 				"kind": c.get("kind", "crossfade"),
 				"fade_direction": c.get("fade_direction", "both"),
 				"stinger": c.get("stinger", null),
+				"stinger_key": _stinger_key_of(c),
 			}
 			if c.has("entry_fade_duration"):
 				out["entry_fade_duration"] = c["entry_fade_duration"]
@@ -393,6 +416,7 @@ func stop_playback() -> void:
 
 	if _auto_advance_timer:
 		_auto_advance_timer = null
+	_auto_advance_at = -1.0
 	if _pending_level_switch:
 		_pending_level_switch = null
 	if _pending_node_transition:
@@ -478,14 +502,94 @@ func trigger_sfx(options: Dictionary = {}) -> Array:
 	# (not raw volume) so a re-fired one-shot honors an active live duck.
 	_set_event_gain_amp(_effective_event_amp())
 
+	# The event's authored loop (manual 7.3) applies to the flat trigger as it
+	# does to the positioned one: seamless loops the voice, smart chains passes.
+	var loop_mode: String = _resolve_sfx_loop_mode()
 	var played: Array = []
 	for track in tracks:
-		var report: Dictionary = _trigger_sfx_track(track, iv)
+		var report: Dictionary = _trigger_sfx_track(track, iv, loop_mode)
 		if not report.is_empty():
 			_sfx_voices.append(report["player"])
+			if str(report.get("loop_mode", "")) == "smart":
+				_start_flat_smart_loop(track, iv, report["player"])
 			report.erase("player")
+			report.erase("loop_mode")
 			played.append(report)
 	return played
+
+## The loop mode a flat SFX voice plays under: the event's authored `loop`
+## (SFX, editor-authored) wins; a music-type event loops by nature; otherwise
+## one-shot. Twin of pfa_spatial._resolve_loop_mode / JS triggerSfx.
+func _resolve_sfx_loop_mode() -> String:
+	if not loop.is_empty() and bool(loop.get("enabled", false)):
+		return "smart" if str(loop.get("mode", "seamless")) == "smart" else "seamless"
+	if type == "music":
+		return "seamless"
+	return ""
+
+## Set a stream's loop flag per format (twin of pfa_spatial._set_stream_loop).
+## Called on a per-voice DUPLICATE only: the loaded resource is shared by every
+## one-shot voice of the same file.
+static func _set_stream_loop_flag(stream, enabled: bool, loop_offset: float = 0.0) -> void:
+	if stream is AudioStreamOggVorbis:
+		stream.loop = enabled
+		stream.loop_offset = loop_offset
+	elif stream is AudioStreamMP3:
+		stream.loop = enabled
+		stream.loop_offset = loop_offset
+	elif stream is AudioStreamWAV:
+		stream.loop_mode = AudioStreamWAV.LOOP_FORWARD if enabled else AudioStreamWAV.LOOP_DISABLED
+		if enabled:
+			# A fresh WAV carries loop_end = 0 → loop region [0,0] → voice stuck at 0.
+			stream.loop_begin = 0
+			stream.loop_end = _wav_frames(stream)
+
+## Smart loop on a flat voice: a controller that re-triggers `track` one clip
+## cycle later (a fresh variation + randomization), the next pass rising from
+## silence over the seam while the last is released over the same window. The
+## chain ends when its voice stops by any other hand — stop_sfx_voices, a
+## steal — and stop_sfx_voices ends every controller. The first trigger rolled
+## play_chance; a cycle does not. Spatial twin: _start_smart_loop / _smart_tick;
+## web twin: PFAEvent._scheduleFlatReloop.
+func _start_flat_smart_loop(track: PFATrack, iv: Dictionary, first_player: AudioStreamPlayer) -> void:
+	var ctrl: Dictionary = {"stopped": false, "active": first_player, "track": track, "iv": iv}
+	_flat_smart_ctrls.append(ctrl)
+	_arm_flat_smart_tick(ctrl, first_player)
+
+func _arm_flat_smart_tick(ctrl: Dictionary, player: AudioStreamPlayer) -> void:
+	var cycle: float = float(player.get_meta("play_len", 1.0)) / maxf(0.01, player.pitch_scale)
+	var period: float = maxf(0.05, cycle - _SMART_CROSS_SEC)
+	var t: SceneTreeTimer = get_tree().create_timer(period)
+	var self_id := get_instance_id()   # int capture — freed-object captures print errors
+	t.timeout.connect(func():
+		var ev = instance_from_id(self_id)
+		if ev == null:
+			return
+		ev._flat_smart_tick(ctrl)
+	, CONNECT_ONE_SHOT)
+
+func _flat_smart_tick(ctrl: Dictionary) -> void:
+	if bool(ctrl.get("stopped", false)):
+		_flat_smart_ctrls.erase(ctrl)
+		return
+	var prev = ctrl.get("active", null)
+	# Stopped, stolen or finished by another hand — the chain ends with it.
+	if prev == null or not is_instance_valid(prev) or bool(prev.get_meta("stopped", false)) \
+			or not prev.playing:
+		ctrl["stopped"] = true
+		_flat_smart_ctrls.erase(ctrl)
+		return
+	var track: PFATrack = ctrl["track"]
+	var report: Dictionary = _trigger_sfx_track(track, ctrl.get("iv", {}), "smart", true)
+	if report.is_empty():
+		ctrl["stopped"] = true   # the pool vanished — let the current voice finish out
+		_flat_smart_ctrls.erase(ctrl)
+		return
+	var next: AudioStreamPlayer = report["player"]
+	_sfx_voices.append(next)
+	_release_flat_voice(prev, _SMART_CROSS_SEC)
+	ctrl["active"] = next
+	_arm_flat_smart_tick(ctrl, next)
 
 ## Set adaptive level (quantized or instant). JS: setLevel()
 func set_level(level: int) -> void:
@@ -555,8 +659,8 @@ func navigate(trigger: String) -> bool:
 		_enter_node(target_id, fallback_fade)
 		return true
 
-	# Sort by priority (highest first).
-	candidates.sort_custom(func(a, b): return int(b.get("priority", 0)) - int(a.get("priority", 0)) > 0)
+	# Rank by priority (highest first), equal priorities in authoring order.
+	candidates = _rank_candidates(candidates)
 
 	# Filter by probability (take first passing).
 	for conn in candidates:
@@ -566,6 +670,27 @@ func navigate(trigger: String) -> bool:
 			return true
 
 	return false
+
+## Rank a section's candidate rows: priority, highest first; equal priorities
+## keep the order the rows arrived in (the exporter's authoring order). One
+## stable rank for the trigger and the automatic exit — `Array.sort_custom`
+## is not stable, so a bare priority comparator let equal rows land in any
+## order, where the web engine's sort and the preview's candidate walk keep it.
+func _rank_candidates(rows: Array) -> Array:
+	var decorated: Array = []
+	for i in range(rows.size()):
+		decorated.append({"row": rows[i], "rank": i})
+	decorated.sort_custom(func(a, b):
+		var pa: int = int((a["row"] as Dictionary).get("priority", 0))
+		var pb: int = int((b["row"] as Dictionary).get("priority", 0))
+		if pa != pb:
+			return pa > pb
+		return int(a["rank"]) < int(b["rank"])
+	)
+	var out: Array = []
+	for d in decorated:
+		out.append(d["row"])
+	return out
 
 ## Toggle sub-level on/off with fade. JS: toggleSubLevel()
 func toggle_sub_level(sub_name: String, enabled: bool, fade_dur: float = 0.5) -> bool:
@@ -692,7 +817,12 @@ func get_current_node_name() -> String:
 # ══════════════════════════════════════════════════════════════════════
 
 ## JS: _enterNode(nodeId, fadeSettings)
-func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
+## Enter `node_id` with the route's `fade_settings` (a connection row's fields,
+## resolved by the caller). `at_time` is the authored moment the request stands
+## for when it is not "now" (-1): the automatic exit passes the endpoint of the
+## section's repeats, so the route quantizes against the endpoint and the
+## entered section counts its own repeats from it. JS parity: `_enterNode`.
+func _enter_node(node_id: String, fade_settings: Dictionary, at_time: float = -1.0) -> void:
 	var nodes: Dictionary = _node_graph_data.get("nodes", {})
 	if not nodes.has(node_id):
 		push_warning("[PFA] Node not found: %s" % node_id)
@@ -704,10 +834,20 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 	# level_index that this node maps to.
 	var target_level: int = int(node.get("level_index", 0))
 
-	# Cascade: connection → node → event defaults.
-	var fd: float = float(fade_settings.get("fade_duration", node.get("fade_duration", fade_duration)))
-	var fc: String = str(fade_settings.get("fade_curve", node.get("fade_curve", fade_curve)))
-	var quantize: String = str(fade_settings.get("quantize", node.get("fade_quantize", switch_quantization)))
+	# Fade settings: the route's own, else the event's. A section node's fade_*
+	# fields are the Node Editor's residue (a transition node's defaults
+	# serialized on every node) — not a transition's settings.
+	var fd: float = float(fade_settings.get("fade_duration", fade_duration))
+	var fc: String = str(fade_settings.get("fade_curve", fade_curve))
+	# Quantization: the route's own, else the event's Switch. A target with
+	# `restart_on_entry` waits for the next BAR regardless: its clip starts from
+	# sample 0 at the switch, and for that to sit on the pulse the switch must be
+	# a bar line — "beat 1 at an arbitrary sample" is not a thing. Leaving a
+	# Free-tempo section there is no grid, so `_get_quantized_time` makes even
+	# that entry instant. Preview parity: `_route_switch_position`.
+	var quantize: String = str(fade_settings.get("quantize", switch_quantization))
+	if bool(node.get("restart_on_entry", false)):
+		quantize = "bar"
 
 	if old_node.is_empty():
 		# First node — no quantization, apply immediately.
@@ -720,16 +860,21 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 				_prestart_track_level_specific(track, 0.0)
 				_activate_level(track, target_level, 0.0)
 		_stop_all_sub_levels_immediate()
-		_sync_bar_duration_to_current_node()
-		_schedule_auto_advance(node)
+		# The first section starts on the play start — the grid's origin and
+		# the moment its repeats count from.
+		_sync_bar_duration_to_current_node(_play_start_time)
+		_schedule_auto_advance(node, _play_start_time)
 		_dlog("[PFA] Entered node \"%s\" (%s), level=%d" % [node.get("name", ""), node_id, target_level])
 	else:
-		# Node transition — check quantization.
-		var boundary: float = _get_quantized_time(quantize)
+		# Node transition — check quantization (against the authored moment when
+		# the request stands for one: the automatic exit's endpoint).
+		var boundary: float = _get_quantized_time(quantize, at_time)
 		if boundary > 0.0:
 			_schedule_node_transition(node_id, node, target_level, fd, fc, fade_settings, boundary)
 		else:
-			_apply_node_transition(node_id, node, target_level, fd, fc, fade_settings)
+			# Instant — an automatic exit that lands instantly still dates the
+			# entry at its endpoint, so the next repeats count from the grid.
+			_apply_node_transition(node_id, node, target_level, fd, fc, fade_settings, at_time)
 
 ## JS: _applyNodeTransition(...)
 ## Editor Phase 2 parity: dispatches on fade_settings.kind:
@@ -744,8 +889,10 @@ func _enter_node(node_id: String, fade_settings: Dictionary) -> void:
 ##   fade_out → fade_in chain — flattened by the exporter into ONE connection
 ##     carrying `entry_fade_duration` / `entry_fade_curve`; the new level ramps
 ##     up from 0 after the switch instead of hard-cutting.
+## `entry_time` = the authored moment of this switch (the boundary it was
+## scheduled on, or the automatic endpoint that chose it); -1 = now.
 func _apply_node_transition(node_id: String, node: Dictionary, target_level: int,
-		fd: float, fc: String, fade_settings: Dictionary) -> void:
+		fd: float, fc: String, fade_settings: Dictionary, entry_time: float = -1.0) -> void:
 	# Any in-flight fade_out deferred switch is superseded by this new transition.
 	_pending_switch_gen += 1   # cancels an in-flight deferred switch (was: _pending_fade_out_switch = null)
 
@@ -763,15 +910,15 @@ func _apply_node_transition(node_id: String, node: Dictionary, target_level: int
 	var kind: String = str(fade_settings.get("kind", "crossfade"))
 	match kind:
 		"fade_in":
-			_apply_transition_fade_in(node_id, node, target_level, fd, fade_settings, from_node_id)
+			_apply_transition_fade_in(node_id, node, target_level, fd, fade_settings, from_node_id, entry_time)
 		"fade_out":
-			_apply_transition_fade_out(node_id, node, target_level, fd, fade_settings, from_node_id)
+			_apply_transition_fade_out(node_id, node, target_level, fd, fade_settings, from_node_id, entry_time)
 		_:
-			_apply_transition_crossfade(node_id, node, target_level, fd, fade_settings, from_node_id)
+			_apply_transition_crossfade(node_id, node, target_level, fd, fade_settings, from_node_id, entry_time)
 
 ## Classic two-way crossfade (pre-existing semantic, curve-shaped amp-domain).
 func _apply_transition_crossfade(node_id: String, node: Dictionary, target_level: int,
-		fd: float, fade_settings: Dictionary, from_node_id: String) -> void:
+		fd: float, fade_settings: Dictionary, from_node_id: String, entry_time: float = -1.0) -> void:
 	current_node = node_id
 	current_level = target_level
 
@@ -780,8 +927,9 @@ func _apply_transition_crossfade(node_id: String, node: Dictionary, target_level
 		if track.level_behavior == "always_play" or track.level_behavior == "level_conditional":
 			continue
 		_activate_level(track, target_level, fd, curve)
+	_apply_shared_chance_for_level(target_level, fd, curve)
 
-	_post_transition_common(node_id, node, target_level, fade_settings, "crossfade", fd, from_node_id)
+	_post_transition_common(node_id, node, target_level, fade_settings, "crossfade", fd, from_node_id, entry_time)
 
 ## Fade In: OLD hard-stops (anti-click floor absorbs the cut), NEW ramps 0→volume over fd.
 ## Editor reference: it calls start_entry_fade on the NEW tracks
@@ -789,7 +937,7 @@ func _apply_transition_crossfade(node_id: String, node: Dictionary, target_level
 ## we get the same shape by silencing all non-target levels instantly (with anti-click)
 ## and giving the target level the long ramp.
 func _apply_transition_fade_in(node_id: String, node: Dictionary, target_level: int,
-		fd: float, fade_settings: Dictionary, from_node_id: String) -> void:
+		fd: float, fade_settings: Dictionary, from_node_id: String, entry_time: float = -1.0) -> void:
 	current_node = node_id
 	current_level = target_level
 
@@ -808,8 +956,9 @@ func _apply_transition_fade_in(node_id: String, node: Dictionary, target_level: 
 		var passed_chance: bool = _level_chance_verdict(tracks.find(track), target_level)
 		var target_amp: float = track.volume if passed_chance else 0.0
 		_ramp_level_gain(track, target_level, target_amp, fd, curve)
+	_apply_shared_chance_for_level(target_level, fd, curve)
 
-	_post_transition_common(node_id, node, target_level, fade_settings, "fade_in", fd, from_node_id)
+	_post_transition_common(node_id, node, target_level, fade_settings, "fade_in", fd, from_node_id, entry_time)
 
 ## Fade Out: OLD fades vol→0 over fd. At fade_end, switch to target.
 ## Phase 3 chain support: if fade_settings carries `entry_fade_duration` /
@@ -817,10 +966,14 @@ func _apply_transition_fade_in(node_id: String, node: Dictionary, target_level: 
 ## NEW level ramps 0 → volume over entry_fade_duration after the switch instead of
 ## hard-cutting. No chain fields → hard-switch with anti-click (original behavior).
 func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level: int,
-		fd: float, fade_settings: Dictionary, from_node_id: String) -> void:
+		fd: float, fade_settings: Dictionary, from_node_id: String, entry_time: float = -1.0) -> void:
 	# Cancel any auto-advance scheduled for the OLD node — it would fire mid-fade.
 	if _auto_advance_timer:
 		_auto_advance_timer = null
+	_auto_advance_at = -1.0
+	# The hand-over is dated at the ramp's authored end: the NEW section starts
+	# there and counts its repeats from it.
+	var hand_over_at: float = (entry_time if entry_time >= 0.0 else _now()) + fd
 
 	var exit_curve: String = str(fade_settings.get("fade_curve", "equal_power"))
 	var exit_ramp: Tween = null
@@ -871,9 +1024,10 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 			if t.level_behavior == "always_play" or t.level_behavior == "level_conditional":
 				continue
 			ev._activate_level(t, captured_level, entry_fd, entry_curve)
+		ev._apply_shared_chance_for_level(captured_level, entry_fd, entry_curve)
 		var label: String = "fade_out/fade_in" if entry_fd > 0.0 else "fade_out/switch"
 		ev._post_transition_common(captured_id, captured_node, captured_level,
-				captured_fs, label, entry_fd, captured_from)
+				captured_fs, label, entry_fd, captured_from, hand_over_at)
 	)
 
 	var chain_suffix: String = (" + fade in %.2fs (%s)" % [entry_fd, entry_curve]) if entry_fd > 0.0 else ""
@@ -895,19 +1049,25 @@ func _apply_transition_fade_out(node_id: String, node: Dictionary, target_level:
 ## sub-level cleanup, conductor bar-dur sync, auto-advance scheduling, log line.
 func _post_transition_common(node_id: String, node: Dictionary, target_level: int,
 		fade_settings: Dictionary, kind_label: String, fd: float,
-		from_node_id: String) -> void:
-	# v2: fade_settings["stinger"] is a Dictionary (or null/missing). Bundle was loaded
-	# in load_samples() under the `${src}::${tgt}` key — recompute here.
+		from_node_id: String, entry_time: float = -1.0) -> void:
+	# v2: fade_settings["stinger"] is a Dictionary (or null/missing). The bundle
+	# is the ROW's (`stinger_key`, set by _execute_transition /
+	# _find_connection_fade); the pair key is the fallback for a caller that
+	# resolved no row.
 	var stinger_data = fade_settings.get("stinger", null)
 	if stinger_data is Dictionary and not (stinger_data as Dictionary).is_empty() and not from_node_id.is_empty():
-		_play_stinger("%s::%s" % [from_node_id, node_id])
+		_play_stinger(str(fade_settings.get("stinger_key", "%s::%s" % [from_node_id, node_id])))
 
 	if bool(node.get("restart_on_entry", false)):
 		_restart_all_players_of_level(target_level)
 
 	_stop_all_sub_levels_immediate()
-	_sync_bar_duration_to_current_node()
-	_schedule_auto_advance(node)
+	# The entered section's authored start: the boundary the switch was
+	# scheduled on / the automatic endpoint that chose it / the Fade Out's
+	# hand-over; now for an instant click. The grid re-anchors here when the
+	# bar length changes, and the repeats count from here.
+	_sync_bar_duration_to_current_node(entry_time)
+	_schedule_auto_advance(node, entry_time)
 
 	var from_name: String = _resolve_node_name(from_node_id)
 	var direction: String = str(fade_settings.get("fade_direction", "both"))
@@ -954,6 +1114,7 @@ func _schedule_node_transition(node_id: String, node: Dictionary, target_level: 
 	var captured_fd := fd
 	var captured_fc := fc
 	var captured_fs := fade_settings
+	var captured_when := when_time
 	var self_id := get_instance_id()   # int capture — freed-object captures print errors
 	nt_timer.timeout.connect(func():
 		var ev = instance_from_id(self_id)
@@ -963,17 +1124,23 @@ func _schedule_node_transition(node_id: String, node: Dictionary, target_level: 
 			return  # superseded or cancelled — SceneTreeTimers can't be aborted (stale-timer class)
 		ev._pending_node_transition = null
 		if not ev.is_playing: return
-		ev._apply_node_transition(captured_id, captured_node, captured_level, captured_fd, captured_fc, captured_fs)
+		# The switch is dated at the boundary it was scheduled on, not at the
+		# frame the timer reached it.
+		ev._apply_node_transition(captured_id, captured_node, captured_level, captured_fd, captured_fc, captured_fs, captured_when)
 		_dlog("[PFA] Quantized node transition applied")
 	, CONNECT_ONE_SHOT)
 
-## JS: _executeTransition(connection)
-func _execute_transition(connection: Dictionary) -> void:
+## JS: _executeTransition(connection, atTime). Fields the row omits resolve to
+## the EVENT's fade_duration / fade_curve / switch_quantization — a direct edge
+## (no transition node) ships none. `at_time`: the authored moment of the
+## request when it is not "now" (the automatic exit's endpoint).
+func _execute_transition(connection: Dictionary, at_time: float = -1.0) -> void:
 	var fs: Dictionary = {
 		"fade_duration": connection.get("fade_duration", fade_duration),
 		"fade_curve": connection.get("fade_curve", fade_curve),
 		"quantize": connection.get("quantize", switch_quantization),
 		"stinger": connection.get("stinger", null),
+		"stinger_key": _stinger_key_of(connection),
 		"kind": connection.get("kind", "crossfade"),
 		"fade_direction": connection.get("fade_direction", "both"),
 		"auto": connection.get("auto", false),
@@ -981,15 +1148,16 @@ func _execute_transition(connection: Dictionary) -> void:
 	if connection.has("entry_fade_duration"):
 		fs["entry_fade_duration"] = connection["entry_fade_duration"]
 		fs["entry_fade_curve"] = connection.get("entry_fade_curve", "equal_power")
-	_enter_node(connection.get("target", ""), fs)
+	_enter_node(connection.get("target", ""), fs, at_time)
 
 ## JS: _scheduleAutoAdvance(node) — extended to support free_tempo (editor-Phase-1.5 pattern).
 ## If no outgoing auto connection exists but the node carries `terminal_fade` metadata
 ## (exporter-flattened dangling fade_out), we fire the terminal fade instead — authored
 ## intent is "this node ends with that fade, play it then stop".
-func _schedule_auto_advance(node: Dictionary) -> void:
+func _schedule_auto_advance(node: Dictionary, entry_time: float = -1.0) -> void:
 	if _auto_advance_timer:
 		_auto_advance_timer = null
+	_auto_advance_at = -1.0
 
 	var loop_count: int = int(node.get("loop_count", 0))
 	if loop_count <= 0:
@@ -1026,10 +1194,18 @@ func _schedule_auto_advance(node: Dictionary) -> void:
 	if duration <= 0.0:
 		return
 
-	_dlog("[PFA] Auto-advance in %.3fs (node=%s, loop_count=%d, free=%s, terminal=%s)" % [
-		duration, current_node, loop_count, str(free_tempo), str(has_terminal and not has_auto)])
+	# The endpoint counts from the section's authored entry (the boundary it
+	# was scheduled on, the endpoint that chose it, the Fade Out's hand-over)
+	# — so a chain of automatic sections holds the grid, and the route chosen
+	# there quantizes against the endpoint, not against the frame's lateness.
+	var now: float = _now()
+	var at: float = (entry_time if entry_time >= 0.0 else now) + duration
+	_auto_advance_at = at
 
-	var aa_timer: SceneTreeTimer = get_tree().create_timer(duration)
+	_dlog("[PFA] Auto-advance in %.3fs (node=%s, loop_count=%d, free=%s, terminal=%s)" % [
+		maxf(0.0, at - now), current_node, loop_count, str(free_tempo), str(has_terminal and not has_auto)])
+
+	var aa_timer: SceneTreeTimer = get_tree().create_timer(maxf(0.0, at - now))
 	_auto_advance_timer = aa_timer
 	var self_id := get_instance_id()   # int capture — freed-object captures print errors
 	aa_timer.timeout.connect(func():
@@ -1050,13 +1226,14 @@ func _schedule_auto_advance(node: Dictionary) -> void:
 		if not ev.is_playing:
 			return
 		if has_auto:
-			ev._execute_auto_advance()
+			ev._execute_auto_advance(at)
 		else:
 			ev.stop_with_terminal_fade()
 	, CONNECT_ONE_SHOT)
 
-## JS: _executeAutoAdvance()
-func _execute_auto_advance() -> void:
+## JS: _executeAutoAdvance(atTime). `at_time` = the endpoint of the repeats
+## the timer was set for — the route is dated there, whatever the lateness.
+func _execute_auto_advance(at_time: float = -1.0) -> void:
 	if current_node.is_empty() or _node_graph_data.is_empty():
 		return
 	var connections: Array = _node_graph_data.get("connections", [])
@@ -1069,7 +1246,7 @@ func _execute_auto_advance() -> void:
 	if candidates.is_empty():
 		_dlog("[PFA] No auto-advance from \"%s\"" % current_node)
 		return
-	candidates.sort_custom(func(a, b): return int(b.get("priority", 0)) - int(a.get("priority", 0)) > 0)
+	candidates = _rank_candidates(candidates)
 	for conn in candidates:
 		var prob: float = float(conn.get("probability", 100))
 		if randf() * 100.0 <= prob:
@@ -1077,7 +1254,7 @@ func _execute_auto_advance() -> void:
 			# auto_advanced / node_applied fire from _post_transition_common at the
 			# APPLY point (the connection carries auto:true) — emitting here would
 			# report the OLD node on the quantized/fade_out paths.
-			_execute_transition(conn)
+			_execute_transition(conn, at_time)
 			return
 
 
@@ -1116,44 +1293,63 @@ func _calc_next_loop_boundary(track: PFATrack, level: int) -> float:
 		return prev_boundary
 	return boundary
 
-## JS: _calcNextBarBoundary()
-func _calc_next_bar_boundary() -> float:
+## JS: _calcNextBarBoundary(refTime). Next bar line on the grid anchored at
+## `_bar_grid_anchor` (the play start, or the entry of the section whose Tempo
+## node changed the bar length).
+##
+## Two callers, two rules. A click (`ref_time` < 0) asks for the next bar from
+## NOW, and a boundary closer than 10 ms is pushed a bar on — a ramp cannot be
+## armed on a line already under the playhead. The automatic exit passes the
+## endpoint of its section's repeats as `ref_time`: that endpoint IS a bar line
+## whenever the section was entered on one, so the line at or just before it
+## (within the loop boundaries' ~33 ms jitter window) is the answer even though
+## the timer that reached it fired a frame late — the near-now guard applied
+## here a second time made every bar-quantized automatic route wait a full
+## extra bar. A past boundary applies on the next frame.
+func _calc_next_bar_boundary(ref_time: float = -1.0) -> float:
 	var now: float = _now()
 	if _bar_duration_sec <= 0.0:
 		return now
-	var elapsed: float = now - _play_start_time
-	var bars_so_far: int = int(ceil(elapsed / _bar_duration_sec))
-	var boundary: float = _play_start_time + bars_so_far * _bar_duration_sec
-	if boundary - now < 0.01:
-		boundary += _bar_duration_sec
-	return boundary
+	return _next_grid_line(_bar_duration_sec, now, ref_time)
 
-## JS: _calcNextBeatBoundary()
-func _calc_next_beat_boundary() -> float:
+## JS: _calcNextBeatBoundary(refTime) — the same rules as the bar.
+func _calc_next_beat_boundary(ref_time: float = -1.0) -> float:
 	var beats_per_bar: int = int(time_signature[0]) if time_signature.size() > 0 else 4
 	var beat_dur: float = _bar_duration_sec / beats_per_bar
 	if beat_dur <= 0.0:
 		return _now()
-	var now: float = _now()
-	var elapsed: float = now - _play_start_time
-	var beats_so_far: int = int(ceil(elapsed / beat_dur))
-	var boundary: float = _play_start_time + beats_so_far * beat_dur
-	if boundary - now < 0.01:
-		boundary += beat_dur
-	return boundary
+	return _next_grid_line(beat_dur, _now(), ref_time)
 
-## JS: _getQuantizedTime(quantize) — returns -1 (=null in JS) for instant.
+func _next_grid_line(period: float, now: float, ref_time: float) -> float:
+	var anchor: float = _bar_grid_anchor
+	if ref_time >= 0.0:
+		# The authored endpoint: the line at or just before it wins.
+		var lines_so_far: int = int(ceil((ref_time - anchor) / period))
+		var line: float = anchor + lines_so_far * period
+		var prev: float = line - period
+		if prev >= anchor - 0.001 and ref_time - prev < 0.033:
+			return prev
+		return line
+	var lines_now: int = int(ceil((now - anchor) / period))
+	var next_line: float = anchor + lines_now * period
+	if next_line - now < 0.01:
+		next_line += period
+	return next_line
+
+## JS: _getQuantizedTime(quantize, refTime) — returns -1 (=null in JS) for instant.
 ## Editor Phase 1.5 parity: if current node has free_tempo, force instant —
-## there's no bar/beat grid to snap to (the editor does the same in
+## there's no bar/beat grid to snap to (the preview's
 ## _compute_scheduled_switch_position). Covers level switches, node transitions,
 ## and connection-level quantize overrides since they all route through here.
-func _get_quantized_time(quantize: String) -> float:
+## `ref_time`: the authored moment the request stands for (the automatic exit's
+## endpoint) — see `_calc_next_bar_boundary`.
+func _get_quantized_time(quantize: String, ref_time: float = -1.0) -> float:
 	if _is_current_node_free_tempo():
 		return -1.0
 	if quantize == "bar":
-		return _calc_next_bar_boundary()
+		return _calc_next_bar_boundary(ref_time)
 	if quantize == "beat":
-		return _calc_next_beat_boundary()
+		return _calc_next_beat_boundary(ref_time)
 	return -1.0
 
 func _is_current_node_free_tempo() -> bool:
@@ -1173,10 +1369,12 @@ func _start_conductor() -> void:
 		return  # already running
 	var beats_per_bar: int = int(time_signature[0]) if time_signature.size() > 0 else 4
 	_bar_duration_sec = (60.0 / bpm) * beats_per_bar if bpm > 0 else 2.0
+	_bar_grid_anchor = _play_start_time
 	_bar_counter = 0
 	_initial_play_chance_roll()
-	# Sync bar duration to current node (may override event BPM via Tempo flatten).
-	_sync_bar_duration_to_current_node()
+	# Sync bar duration to current node (may override event BPM via Tempo
+	# flatten) — the grid still starts at the play start.
+	_sync_bar_duration_to_current_node(_play_start_time)
 	_schedule_next_bar_tick()
 
 func _schedule_next_bar_tick() -> void:
@@ -1221,8 +1419,12 @@ func _initial_play_chance_roll() -> void:
 	_track_chance_state.clear()
 	for i in range(tracks.size()):
 		var track: PFATrack = tracks[i]
-		if track.level_behavior == "always_play" or track.level_behavior == "level_conditional":
-			continue
+		# A shared (all levels) track rolls too: its metadata block carries a
+		# play_chance per level (the preview rolls play_chance_per_level for it
+		# as for a level-specific track), and the verdict of the level that
+		# plays gates the ONE shared lane (_ramp_shared_gain). A shared track
+		# without the block has no level entries — nothing to roll, the lane
+		# plays.
 		var levels_state: Dictionary = {}
 		for lvl_key in track.level_samples:
 			var lvl: int = int(lvl_key)
@@ -1355,13 +1557,18 @@ func _level_chance_verdict(track_idx: int, level: int) -> bool:
 		return true
 	return bool(levels_state[level]["playing"])
 
-## JS: _applyChanceGain(track, level, playing, whenTime)
-## Godot: when_time > 0 → schedule; else apply now.
-func _apply_chance_gain(track: PFATrack, level: int, playing: bool, when_time: float) -> void:
+## JS: _applyChanceGain(track, level, playing, whenTime, fadeOverride)
+## Godot: when_time > 0 → schedule; else apply now. `fade_override` ≥ 0 is the
+## transition's own fade when a level change applies the new level's verdict
+## to a shared lane (the chance fade is the reroll's).
+func _apply_chance_gain(track: PFATrack, level: int, playing: bool, when_time: float,
+		fade_override: float = -1.0) -> void:
 	var now: float = _now()
 	var t0: float = when_time if when_time > 0.0 else now
 	var target_amp: float = track.volume if playing else 0.0
 	var fade_sec: float = track.chance_fade_duration if track.chance_fade_mode == "fade" else 0.01
+	if fade_override >= 0.0:
+		fade_sec = fade_override
 
 	if t0 > now + 0.005:
 		# Future-scheduled: wait then apply.
@@ -1385,10 +1592,72 @@ func _apply_chance_gain(track: PFATrack, level: int, playing: bool, when_time: f
 			if not ev.is_playing: return
 			if captured_gen != ev._transition_gen: return
 			if captured_level != ev.current_level: return
-			ev._ramp_level_gain(captured_track, captured_level, captured_amp, captured_fade)
+			ev._ramp_chance_target(captured_track, captured_level, captured_amp, captured_fade)
 		, CONNECT_ONE_SHOT)
 	else:
+		_ramp_chance_target(track, level, target_amp, fade_sec)
+
+## The chance verdict's ramp lands on the lane it gates: a level_specific
+## track's level player, a shared track's ONE lane (whatever the level).
+func _ramp_chance_target(track: PFATrack, level: int, target_amp: float, fade_sec: float) -> void:
+	if track.level_behavior == "always_play" or track.level_behavior == "level_conditional":
+		_ramp_shared_gain(track, target_amp, fade_sec)
+	else:
 		_ramp_level_gain(track, level, target_amp, fade_sec)
+
+## Tween the ACTIVE shared player of `track` to `target_amp` over `fd`, and
+## remember the target: the event-gain refresh re-applies it once the ramp is
+## over, and a variation switch hands it to the incoming player. The shared
+## lane used to sit at track.volume for good — the refresh wrote it back on
+## every Release / duck / volume move. Twin of _ramp_level_gain for one lane.
+func _ramp_shared_gain(track: PFATrack, target_amp: float, fd: float,
+		curve: String = "equal_power") -> Tween:
+	var state: Dictionary = _track_shared.get(track.name, {})
+	if state.is_empty():
+		return null
+	var players: Array = state.get("players", [])
+	var active: int = int(state.get("active", 0))
+	if active < 0 or active >= players.size():
+		return null
+	var player: AudioStreamPlayer = players[active]
+	if not is_instance_valid(player):
+		return null
+	var prev_tween: Tween = state.get("tween", null)
+	if prev_tween and prev_tween.is_valid():
+		prev_tween.kill()
+	var amp_changing: bool = absf(_current_amp_of_player(player) - target_amp) > 0.001
+	if fd < _MICRO_FADE_SEC:
+		if amp_changing:
+			fd = _MICRO_FADE_SEC
+		else:
+			player.volume_db = _combined_db_for_amp(target_amp)
+			state["target_amp"] = target_amp
+			state["tween"] = null
+			return null
+	var tween: Tween = _equal_power_tween_to_amp(player, target_amp, fd, curve)
+	state["target_amp"] = target_amp
+	state["tween"] = tween
+	return tween
+
+## A level change applies the new level's chance verdict to every shared lane
+## over the transition's own fade — the preview switches a shared track's
+## verdict with its level (its track state is kept per level). Called at
+## the apply point of every level switch (the three transition kinds, the Fade
+## Out's hand-over, the simple-mode crossfade). JS: _applySharedChanceForLevel.
+func _apply_shared_chance_for_level(level: int, fd: float, curve: String = "equal_power") -> void:
+	for i in range(tracks.size()):
+		var track: PFATrack = tracks[i]
+		if not (track.level_behavior == "always_play" or track.level_behavior == "level_conditional"):
+			continue
+		if not _track_chance_state.has(i) or (_track_chance_state[i] as Dictionary).is_empty():
+			continue
+		var state: Dictionary = _track_shared.get(track.name, {})
+		if state.is_empty():
+			continue
+		var target: float = track.volume if _level_chance_verdict(i, level) else 0.0
+		var current: float = float(state.get("target_amp", track.volume))
+		if absf(target - current) > 0.001:
+			_ramp_shared_gain(track, target, fd, curve)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1493,10 +1762,11 @@ func _apply_variation_switch(track: PFATrack, level: int, is_shared: bool) -> vo
 	var old_player: AudioStreamPlayer = players[old_variation]
 	var new_player: AudioStreamPlayer = players[new_variation]
 
-	# Target amp for NEW variation = the level's current target_amp (active level full, else 0).
+	# Target amp for NEW variation = the level's current target_amp (active level full, else 0);
+	# a shared lane's = its chance target (track.volume, or 0 while the verdict is silent).
 	var track_target_amp: float
 	if is_shared:
-		track_target_amp = track.volume
+		track_target_amp = float(_track_shared.get(track.name, {}).get("target_amp", track.volume))
 	else:
 		var lvl_state: Dictionary = _track_level_state.get(track.name, {}).get(level, {})
 		track_target_amp = float(lvl_state.get("target_amp", 0.0))
@@ -1640,11 +1910,13 @@ func _play_music_shared(track: PFATrack, offset_seconds: float) -> void:
 	if players.is_empty():
 		return
 	var initial_active: int = clampi(track.current_variation("shared"), 0, players.size() - 1)
-	_track_shared[track.name] = {"players": players, "active": initial_active}
-	# Shared tracks always active at track.volume.
+	_track_shared[track.name] = {"players": players, "active": initial_active,
+		"target_amp": track.volume, "tween": null}
+	# Shared tracks start at track.volume; a chance verdict may lower the lane
+	# (_ramp_shared_gain keeps the target beside the players).
 	var active_player: AudioStreamPlayer = players[initial_active]
 	if is_instance_valid(active_player):
-		_equal_power_tween_to_amp(active_player, track.volume, 0.02)
+		_track_shared[track.name]["tween"] = _equal_power_tween_to_amp(active_player, track.volume, 0.02)
 
 ## JS: PFATrack.activateLevel(level, fadeDuration)
 ## Godot: per-level ramp via Tween. target_amp = track.volume if level matches AND chance passes.
@@ -1847,6 +2119,7 @@ func _crossfade_level(old_level: int, new_level: int) -> void:
 		# defaulted to equal_power → a front-loaded ramp that sounds much faster than the set
 		# duration even when the user picked Linear. Node-mode transitions already thread it.
 		_activate_level(track, new_level, fade_duration, fade_curve)
+	_apply_shared_chance_for_level(new_level, fade_duration, fade_curve)
 	# restart_on_entry currently only a node-graph concept; simple-mode level setLevel doesn't carry it.
 
 ## Seek ALL variation players of this level to 0 AND set per-level phase anchor
@@ -1917,6 +2190,8 @@ func _enable_sub_level(sub: Dictionary, fade_dur: float) -> void:
 	var sub_level: int = int(sub.get("level_index", current_level))
 
 	var players: Array = []
+	var targets: Dictionary = {}   # player instance id → settled pre-event amp
+	var tweens: Dictionary = {}    # player instance id → its enable ramp
 	for track in sub_tracks:
 		if not track._samples_loaded:
 			track.load_streams(_base_path)
@@ -1952,11 +2227,17 @@ func _enable_sub_level(sub: Dictionary, fade_dur: float) -> void:
 			start_offset - (clip_for_var.source_offset if clip_for_var else 0.0))
 		# Fade in from -80 → track × sub volume × event.
 		var target_amp: float = track.volume * sub_volume
-		_equal_power_tween_to_amp(player, target_amp, fade_dur)
+		var tw: Tween = _equal_power_tween_to_amp(player, target_amp, fade_dur)
 		players.append(player)
+		# The settled amplitude and the ramp that reaches it, per player: the
+		# event-gain refresh re-applies the target once the ramp is over.
+		targets[player.get_instance_id()] = target_amp
+		if tw != null:
+			tweens[player.get_instance_id()] = tw
 
 	_sub_level_states[sub_name] = {
 		"enabled": true, "players": players, "tracks": sub_tracks,
+		"targets": targets, "tweens": tweens,
 	}
 
 ## JS: _disableSubLevel(sub, subName, fadeDuration)
@@ -1991,6 +2272,8 @@ func _disable_sub_level(_sub: Dictionary, sub_name: String, fade_dur: float) -> 
 				p.queue_free()
 	)
 	state["players"] = []
+	state["targets"] = {}
+	state["tweens"] = {}
 	state["enabled"] = false
 
 ## Stop all sub-levels "immediately" = anti-click micro-fade, then free. Called on node
@@ -2019,6 +2302,8 @@ func _stop_all_sub_levels_immediate() -> void:
 					p.queue_free()
 		)
 		state["players"] = []
+		state["targets"] = {}
+		state["tweens"] = {}
 		state["enabled"] = false
 
 
@@ -2263,6 +2548,13 @@ func _max_track_volume() -> float:
 ## (single-owner rule — no extra freer that could race a captured player). A voice
 ## still waiting on its delay timer has made no sound — free it outright.
 func _release_sfx_voice(player) -> void:
+	_release_flat_voice(player, 0.02)   # 20 ms anti-click seam (JS parity)
+
+## Release a flat voice over `seconds`: it leaves the pool at once, ramps to
+## silence, and — a LOOP voice, which no trim-stop timer or `finished` will
+## ever free — is stopped and freed when the ramp ends. A one-shot keeps its
+## own freer (its stop timer / finished), as before.
+func _release_flat_voice(player, seconds: float) -> void:
 	_sfx_voices.erase(player)
 	if not is_instance_valid(player):
 		return
@@ -2282,12 +2574,24 @@ func _release_sfx_voice(player) -> void:
 		player.volume_db = maxf(linear_to_db(maxf(amp, 0.000001)), -80.0)
 	var tw: Tween = player.create_tween()
 	player.set_meta("sfx_tw", tw)
-	tw.tween_method(setter, 0.0, 1.0, 0.02)   # 20 ms anti-click seam (JS parity)
+	tw.tween_method(setter, 0.0, 1.0, maxf(seconds, 0.02))
+	if bool(player.get_meta("loop_voice", false)):
+		tw.finished.connect(func() -> void:
+			if is_instance_valid(player):
+				player.stop()
+				player.queue_free()
+		, CONNECT_ONE_SHOT)
 
 ## Trigger one SFX voice for a track. Returns a play-report dict carrying the player
 ## ({ player, track, behavior, variation, variation_count, algo, sample }) or {} when the
 ## track did not fire. JS: PFATrack.triggerSfx.
-func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
+## `loop_mode` ("" / "seamless" / "smart", from _resolve_sfx_loop_mode): seamless
+## plays a per-voice copy of the stream with the loop flag and no trim-stop;
+## smart plays one windowed pass at full gain (the seam owns the fades). A
+## one_shot clip never loops. `skip_play_chance` is the smart re-loop's spawn:
+## it rises from silence over the seam, and the first trigger rolled the chance.
+func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}, loop_mode: String = "",
+		skip_play_chance: bool = false) -> Dictionary:
 	# always_play / level_conditional keep their samples in the shared pool, so
 	# level_samples is empty for them — only gate level_specific on missing level data.
 	var is_shared: bool = (track.level_behavior == "always_play" or track.level_behavior == "level_conditional")
@@ -2295,7 +2599,7 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 		return {}
 
 	# play_chance roll
-	if not track.roll_play_chance(current_level):
+	if not skip_play_chance and not track.roll_play_chance(current_level):
 		return {}
 
 	# Fresh variation per trigger (switch_chance-gated), shared vs per-level pool.
@@ -2306,6 +2610,11 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 	if stream == null:
 		return {}
 	var clip: PFARegionClip = pick["clip"]
+
+	# A one_shot clip never loops, whatever the event says (JS parity).
+	var clip_one_shot: bool = clip != null and clip.is_one_shot()
+	var do_seamless: bool = loop_mode == "seamless" and not clip_one_shot
+	var do_smart: bool = loop_mode == "smart" and not clip_one_shot
 
 	var player: AudioStreamPlayer = AudioStreamPlayer.new()
 	player.bus = _voice_bus
@@ -2343,13 +2652,35 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 	# trim-stop/delay timer is still pending, which made the error deterministic).
 	# Bonus: child timers pause in sync with the audio they control (SceneTreeTimers
 	# default to process_always and would cut a paused voice mid-pause).
-	var windowed_stop: bool = has_window and play_len > 0.0
+	# Seamless: a per-voice stream copy carries the loop flag (the loaded resource
+	# is shared by every one-shot voice of the file); the exporter bakes the trim
+	# into a looping asset, so a whole-file loop IS the clip loop (Ogg/MP3 cannot
+	# loop a sub-region — pfa_spatial does the same). No trim-stop on a loop.
+	if do_seamless:
+		var play_stream: AudioStream = stream.duplicate()
+		_set_stream_loop_flag(play_stream, true, offset)
+		player.stream = play_stream
+	player.set_meta("play_len", play_len)
+	player.set_meta("loop_voice", do_seamless)
+
+	var windowed_stop: bool = has_window and play_len > 0.0 and not do_seamless
 	var start_cb := func():
 		if not is_instance_valid(player):
 			return
 		player.set_meta("sfx_started", true)
 		player.play(offset)
-		_apply_sfx_fade_to_player(player, steady_amp, play_len, fade_in, fade_out)
+		if do_smart and skip_play_chance:
+			# A smart re-loop pass: rise from silence over the seam while the
+			# previous pass is released over the same window (the controller).
+			_seam_in_flat_voice(player, steady_amp)
+		elif do_smart:
+			# The first pass of a smart loop: full gain, the seam owns the fades.
+			_apply_sfx_fade_to_player(player, steady_amp, play_len, 0.0, 0.0)
+		elif do_seamless:
+			# A loop: the fade-in once, never the window-end fade-out.
+			_apply_sfx_fade_to_player(player, steady_amp, play_len, fade_in, 0.0)
+		else:
+			_apply_sfx_fade_to_player(player, steady_amp, play_len, fade_in, fade_out)
 		if windowed_stop:
 			var stop_t := Timer.new()
 			stop_t.one_shot = true
@@ -2392,7 +2723,23 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}) -> Dictionary:
 		"variation_count": pick["variation_count"],
 		"algo": track.randomization_algo,
 		"sample": pick.get("sample", ""),
+		"loop_mode": ("smart" if do_smart else ("seamless" if do_seamless else "")),
 	}
+
+## The smart seam's incoming half: `player` rises from silence to `steady_amp`
+## over _SMART_CROSS_SEC (the event/group/master factor folded in per frame).
+func _seam_in_flat_voice(player: AudioStreamPlayer, steady_amp: float) -> void:
+	if player.has_meta("sfx_tw"):
+		var old = player.get_meta("sfx_tw")
+		if old != null and is_instance_valid(old):
+			old.kill()
+	player.volume_db = _combined_db_for_amp(0.0)
+	var setter := func(amp: float):
+		if is_instance_valid(player):
+			player.volume_db = _combined_db_for_amp(amp)
+	var tw: Tween = player.create_tween()
+	player.set_meta("sfx_tw", tw)
+	tw.tween_method(setter, 0.0, steady_amp, _SMART_CROSS_SEC)
 
 ## Apply a one-shot SFX fade envelope to a player's volume_db, mirroring the editor's
 ## RegionClip._apply_fades + JS _applySfxFadeEnvelope: LINEAR-amplitude ramps (not linear-dB).
@@ -2453,6 +2800,10 @@ func _cleanup_sfx_voices() -> void:
 ## has made no sound yet — free it outright (its child timers die with it, so the delayed
 ## start can never fire afterwards).
 func stop_sfx_voices(dur: float, curve: String = "equal_power") -> void:
+	# Every smart chain ends here — no pass may spawn behind the stop.
+	for ctrl in _flat_smart_ctrls:
+		ctrl["stopped"] = true
+	_flat_smart_ctrls.clear()
 	_cleanup_sfx_voices()
 	var fade: float = maxf(dur, 0.02)   # ≥ 20 ms anti-click
 	for player in _sfx_voices.duplicate():
@@ -2479,6 +2830,16 @@ func stop_sfx_voices(dur: float, curve: String = "equal_power") -> void:
 		var tw: Tween = player.create_tween()
 		player.set_meta("sfx_tw", tw)
 		tw.tween_method(setter, 0.0, 1.0, fade)
+		# A loop voice has no trim-stop timer or `finished` to free it: it is
+		# stopped and freed when the ramp ends (a one-shot keeps its own freer).
+		if bool(player.get_meta("loop_voice", false)):
+			player.set_meta("stopped", true)
+			tw.finished.connect(func() -> void:
+				if is_instance_valid(player):
+					player.stop()
+					player.queue_free()
+				_sfx_voices.erase(player)
+			, CONNECT_ONE_SHOT)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2596,7 +2957,9 @@ func _apply_event_gain_to_all_active() -> void:
 				continue  # tween will handle event gain on each frame
 			var target_amp: float = float(lvl_state.get("target_amp", 0.0))
 			p.volume_db = _combined_db_for_amp(target_amp)
-	# Shared players
+	# Shared players: the lane's target (track.volume, or the chance verdict's
+	# 0 / volume) — never a flat track.volume, which un-muted a lane the chance
+	# had silenced on every refresh. A live ramp folds the event gain in itself.
 	for track_name in _track_shared.keys():
 		var shared: Dictionary = _track_shared[track_name]
 		var players: Array = shared.get("players", [])
@@ -2605,16 +2968,31 @@ func _apply_event_gain_to_all_active() -> void:
 			continue
 		var p: AudioStreamPlayer = players[active]
 		if is_instance_valid(p):
+			var shared_tween: Tween = shared.get("tween", null)
+			if shared_tween and shared_tween.is_valid():
+				continue
 			var track := _find_track_by_name(track_name)
 			if track:
-				p.volume_db = _combined_db_for_amp(track.volume)
-	# Sub-level players
+				p.volume_db = _combined_db_for_amp(float(shared.get("target_amp", track.volume)))
+	# Sub-level players. While the enable ramp runs, the ramp folds the event
+	# gain in on every frame; once it has settled the player is re-set here
+	# from its stored target — a Release, a duck or a volume change reaches a
+	# settled sub the way it reaches the main lanes. Players a disable put on
+	# their way out are no longer in the state's list.
 	for sub_name in _sub_level_states.keys():
 		var st: Dictionary = _sub_level_states[sub_name]
+		var targets: Dictionary = st.get("targets", {})
+		var tweens: Dictionary = st.get("tweens", {})
 		for p in st.get("players", []):
-			if is_instance_valid(p):
-				# We don't track per-sub target; leave to disable-fade tween.
-				pass
+			if not is_instance_valid(p):
+				continue
+			var pid: int = p.get_instance_id()
+			if not targets.has(pid):
+				continue
+			var tw: Tween = tweens.get(pid, null)
+			if tw != null and tw.is_valid():
+				continue  # the ramp applies the event gain on each frame
+			p.volume_db = _combined_db_for_amp(float(targets[pid]))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2813,20 +3191,45 @@ func _compute_initial_offset(stream: AudioStream, clips: Array, var_idx: int, of
 	return fmod(offset_seconds, length)
 
 ## Get length (sec) of first available audio stream at current level — for free_tempo auto-advance.
+## Clip length (seconds) of the current node's level — used by free_tempo
+## auto-advance where bars don't apply. The first track, in track order, with
+## a measurable clip answers: a level_specific track from its level pool (level
+## 0 when the level has none), a shared (All levels) track from its variations.
+## The clip WINDOW is what loops — `source_play_length` when the clip has one,
+## else the stream past the clip's `source_offset`. The whole stream answered
+## here before, so a trimmed clip advanced at the length of its file. 0.0 when
+## nothing is measurable. Preview parity: `_get_clip_length_samples`;
+## JS parity: `_getCurrentClipLengthSec`.
 func _get_current_clip_length_sec() -> float:
 	for track in tracks:
-		var streams: Array = track._streams.get(current_level, [])
+		var is_shared: bool = (track.level_behavior == "always_play" or track.level_behavior == "level_conditional")
+		var streams: Array
+		var clips: Array
+		if is_shared:
+			streams = track._shared_streams
+			clips = track._shared_clips
+		else:
+			streams = track._streams.get(current_level, track._streams.get(0, []))
+			clips = track._clips.get(current_level, track._clips.get(0, []))
 		if streams.is_empty():
 			continue
+		var clip: PFARegionClip = _clip_at(clips, 0)
+		if clip != null and clip.source_play_length > 0.0:
+			return clip.source_play_length
 		var s: AudioStream = streams[0]
 		if s and s.has_method("get_length"):
-			var ln: float = s.get_length()
+			var ln: float = s.get_length() - (clip.source_offset if clip != null else 0.0)
 			if ln > 0.0:
 				return ln
 	return 0.0
 
-## Update _bar_duration_sec from current node's BPM/TS (Tempo flatten).
-func _sync_bar_duration_to_current_node() -> void:
+## Update _bar_duration_sec from current node's BPM/TS (Tempo flatten). When
+## the bar length changes, the bar grid is re-anchored at `anchor_time` (the
+## section's authored entry; now when -1) — the new tempo's bar lines run from
+## the moment it took over, not from the play start at the new bar length,
+## which put every later boundary on an arbitrary phase. An unchanged bar
+## length keeps the grid. JS parity: `_syncBarDurationToCurrentNode`.
+func _sync_bar_duration_to_current_node(anchor_time: float = -1.0) -> void:
 	if current_node.is_empty():
 		return
 	var node: Dictionary = _node_graph_data.get("nodes", {}).get(current_node, {})
@@ -2836,7 +3239,10 @@ func _sync_bar_duration_to_current_node() -> void:
 	var node_ts: Array = node.get("time_signature", time_signature)
 	var beats_per_bar: int = int(node_ts[0]) if node_ts.size() > 0 else 4
 	if node_bpm > 0.0 and beats_per_bar > 0:
-		_bar_duration_sec = (60.0 / node_bpm) * beats_per_bar
+		var bar_sec: float = (60.0 / node_bpm) * beats_per_bar
+		if absf(bar_sec - _bar_duration_sec) > 1e-9:
+			_bar_duration_sec = bar_sec
+			_bar_grid_anchor = anchor_time if anchor_time >= 0.0 else _now()
 
 ## Stop all per-level pre-started players for a track.
 func _stop_all_level_players(track: PFATrack) -> void:
@@ -2889,7 +3295,12 @@ func load_samples() -> void:
 				track._bank_loader = _bank_loader
 			track.load_streams(_base_path)
 	# Stinger bundles from node graph (v2: connection.stinger is a Dictionary).
-	# Bundles keyed by `${src}::${tgt}` so 1:N reuse keeps independent state.
+	# Bundles keyed by the ROW's identity — `_stinger_key_of(conn)`: the
+	# exporter's `id` (`A>B|X`: the pair, then the transition node walked), so
+	# two roads between one pair and the two directions of one transition each
+	# own a bundle and a no-repeat history. A row without an id (older configs)
+	# keys by the pair `src::tgt`; keyed by the pair alone, every later road
+	# of the pair was skipped and fired the first road's bundle.
 	if not _node_graph_data.is_empty():
 		var connections: Array = _node_graph_data.get("connections", [])
 		for conn in connections:
@@ -2899,11 +3310,18 @@ func load_samples() -> void:
 			var stinger_dict: Dictionary = stinger_data
 			if (stinger_dict.get("samples", []) as Array).is_empty():
 				continue
-			var key: String = "%s::%s" % [str(conn.get("source", "")), str(conn.get("target", ""))]
+			var key: String = _stinger_key_of(conn)
 			if _stinger_bundles.has(key):
 				continue
 			_load_stinger_bundle(key, stinger_dict)
 	_samples_loaded = true
+
+## The key a connection row's stinger bundle lives under (see load_samples).
+func _stinger_key_of(conn: Dictionary) -> String:
+	var id: String = str(conn.get("id", ""))
+	if not id.is_empty():
+		return id
+	return "%s::%s" % [str(conn.get("source", "")), str(conn.get("target", ""))]
 
 ## Unload audio streams (free memory).
 func unload_samples() -> void:
