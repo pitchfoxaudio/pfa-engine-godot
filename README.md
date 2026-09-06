@@ -157,7 +157,7 @@ If a bank or a sample is missing from a build, the addon says so in the log and 
 
 | Method | Description |
 |--------|-------------|
-| `PFA.navigate(event, trigger) → bool` | Fire a transition by trigger name — `true` if one matched |
+| `PFA.navigate(event, trigger) → bool` | Fire a transition by trigger name — `true` when the request was accepted: a route with that trigger leaves the current node (or, with none, a node carries the trigger and the first road out is taken) and the probability roll passed. `true` means scheduled, not yet applied — `node_changed` marks the apply |
 | `PFA.get_current_node(event) → String` | Current node ID (`""` if none) |
 | `PFA.toggle_sub_level(event, sub_name, enabled, fade := 0.5)` | Toggle a sub-level layer on/off with a fade |
 
