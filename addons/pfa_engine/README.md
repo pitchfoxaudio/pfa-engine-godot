@@ -157,7 +157,7 @@ If a bank or a sample is missing from a build, the addon says so in the log and 
 
 | Method | Description |
 |--------|-------------|
-| `PFA.navigate(event, trigger) → bool` | Fire a transition by trigger name — `true` when the request was accepted: a route with that trigger leaves the current node (or, with none, a node carries the trigger and the first road out is taken) and the probability roll passed. `true` means scheduled, not yet applied — `node_changed` marks the apply |
+| `PFA.navigate(event, trigger) → bool` | Fire a transition by trigger name — `true` when the request was accepted. A route carrying that trigger out of the current node is ranked with its siblings and rolled: `true` means its probability roll passed. With no such route, a node that carries the trigger is entered directly and nothing is rolled — the fade settings are borrowed from the first road leaving the current node, or are the event's own when none does. `true` means scheduled, not yet applied — `node_changed` marks the apply |
 | `PFA.get_current_node(event) → String` | Current node ID (`""` if none) |
 | `PFA.toggle_sub_level(event, sub_name, enabled, fade := 0.5)` | Toggle a sub-level layer on/off with a fade |
 
@@ -167,7 +167,7 @@ Node graph activates when the config has `use_nodes: true`. The engine enters th
 
 | Method | Description |
 |--------|-------------|
-| `PFA.trigger(event, options := {}) → Array` | Trigger a one-shot SFX. `options` may carry `{"intensity": 0..1}` — per-trigger hit strength (see Intensity). Returns `played` — one Dictionary per track that fired: `{ track, behavior, variation, variation_count, algo, sample }` |
+| `PFA.trigger(event, options := {}) → Array` | Trigger an SFX event. A plain event plays once; an event authored with a Loop (Studio's seamless or smart setting) plays until `stop()` — a `one_shot` clip plays once whatever the event says. `options` may carry `{"intensity": 0..1}` — per-trigger hit strength (see Intensity). Returns `played` — one Dictionary per track that fired: `{ track, behavior, variation, variation_count, algo, sample }` |
 
 Cooldown (`cooldown_ms`) and voice cap (`max_instances`, least-audible voice released — see Voice management) are authored per event in Studio and enforced by the engine. `always_play` layers fire on every level; each fired layer picks a fresh sample variation (switch_chance-gated) with clip trim + fades applied.
 

@@ -2640,9 +2640,13 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}, loop_mode: String 
 	var fade_out: float = clip.fade_out if clip != null else 0.0
 
 	# pitch_scale stretches wall-clock duration → divide the trim-stop so we cut after
-	# play_len of BUFFER time (Web Audio parity). Fades keep play_len as their timeline
-	# (mirrors JS positioning fade_out at startTime + playLen).
+	# play_len of BUFFER time (Web Audio parity). The fades ride that same wall
+	# clock: Studio's preview fades the clip and then resamples it, so an authored
+	# fade stretches with the pitch and always ends where the window ends. On the
+	# unscaled timeline a voice pitched up ended before its fade-out began and a
+	# voice pitched down went silent with half its sound still to play.
 	var pitch: float = maxf(0.01, player.pitch_scale)
+	var wall_len: float = play_len / pitch
 	var delay_ms: float = track.sfx_delay_ms()
 
 	# Voice lifecycle timers are Timer CHILDREN of the player, not tree-scoped
@@ -2675,12 +2679,12 @@ func _trigger_sfx_track(track: PFATrack, iv: Dictionary = {}, loop_mode: String 
 			_seam_in_flat_voice(player, steady_amp)
 		elif do_smart:
 			# The first pass of a smart loop: full gain, the seam owns the fades.
-			_apply_sfx_fade_to_player(player, steady_amp, play_len, 0.0, 0.0)
+			_apply_sfx_fade_to_player(player, steady_amp, wall_len, 0.0, 0.0)
 		elif do_seamless:
 			# A loop: the fade-in once, never the window-end fade-out.
-			_apply_sfx_fade_to_player(player, steady_amp, play_len, fade_in, 0.0)
+			_apply_sfx_fade_to_player(player, steady_amp, wall_len, fade_in / pitch, 0.0)
 		else:
-			_apply_sfx_fade_to_player(player, steady_amp, play_len, fade_in, fade_out)
+			_apply_sfx_fade_to_player(player, steady_amp, wall_len, fade_in / pitch, fade_out / pitch)
 		if windowed_stop:
 			var stop_t := Timer.new()
 			stop_t.one_shot = true

@@ -426,7 +426,18 @@ func _resolve_stream(base_path: String, file_path: String) -> AudioStream:
 ## Load AudioStream from absolute path (OGG / WAV / MP3).
 func _load_audio_file(path: String) -> AudioStream:
 	if ResourceLoader.exists(path):
-		return ResourceLoader.load(path)
+		# CACHE_MODE_IGNORE: every load reads the imported file afresh instead of
+		# handing back the object a previous generation still holds. With the
+		# default cache mode a load_pack over a loaded pack (the Live Connect
+		# reload) got the cached instance for every path — the engine serves it
+		# while anything references it, and the outgoing generation does until
+		# its nodes are freed — so a sample Sync had just rewritten under its
+		# own name was never heard until the game restarted. A new generation
+		# never shares audio objects with the old one (the web engine's load
+		# generation draws the same line). Nothing is lost by skipping the
+		# cache: an export names every file per track, so one path is loaded
+		# once per generation anyway.
+		return ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_IGNORE)
 
 	if not FileAccess.file_exists(path):
 		push_warning("[PFA] Cannot load audio: %s%s" % [

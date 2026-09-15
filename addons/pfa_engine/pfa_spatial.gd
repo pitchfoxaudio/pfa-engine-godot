@@ -373,6 +373,12 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 		"max_distance": float(cfg.get("max_distance", 50.0)),
 		"rolloff": float(cfg.get("rolloff", 1.0))})
 	player.set_meta("spawn_us", Time.get_ticks_usec())
+	# The emitter this voice follows (none for a fixed-position trigger): _free_voice
+	# takes the voice out of emitter._players again, so a long-lived emitter lists
+	# what still plays instead of every handle it ever spawned (the list is what
+	# every position update walks and what destroy() releases).
+	if emitter != null:
+		player.set_meta("emitter", emitter)
 	# Register in the EVENT's unified voice pool (flat + spatial share one cap — JS
 	# parity with event._activeVoices). _free_voice unregisters; a mid-release voice
 	# is filtered out by its `stopped` meta.
@@ -391,10 +397,18 @@ func _spawn_voice(event, track, mode: String, pos: Vector3, cfg: Dictionary, rel
 		if not is_instance_valid(player):
 			return
 		player.play(offset)
+		# The fades ride the wall clock the voice plays on: pitch stretches the
+		# window (play_len / pitch is when the trim-stop fires below) and the
+		# authored fades stretch with it — Studio's preview fades the clip and then
+		# resamples it, so a 100 ms fade-out on a voice pitched an octave up lasts
+		# 50 ms and still ends where the window ends. On the unscaled timeline a
+		# voice pitched up ended before its fade-out began and a voice pitched
+		# down went silent with half its sound still to play.
+		var wall_len: float = play_len / pitch
 		if do_seamless:
-			_apply_fade(player, base_db, play_len, fade_in, 0.0, true)   # no fade-out on a loop
+			_apply_fade(player, base_db, wall_len, fade_in / pitch, 0.0, true)   # no fade-out on a loop
 		else:
-			_apply_fade(player, base_db, play_len, fade_in, fade_out, false)
+			_apply_fade(player, base_db, wall_len, fade_in / pitch, fade_out / pitch, false)
 			# One-shot: stop after the trim window (pitch stretches wall-clock).
 			if windowed_stop:
 				var stop_t := Timer.new()
@@ -700,6 +714,9 @@ func _free_voice(player) -> void:
 		var ev = player.get_meta("event", null)
 		if ev != null and is_instance_valid(ev):
 			ev._unregister_spatial_voice(player)
+		var em = player.get_meta("emitter", null)
+		if em != null and is_instance_valid(em):
+			em._players.erase(player)
 		player.queue_free()
 
 
