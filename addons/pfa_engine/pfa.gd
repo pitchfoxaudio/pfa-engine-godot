@@ -20,7 +20,7 @@ extends Node
 ## twin of the web engine's `PFA.VERSION`. THE single literal: `plugin.cfg` is
 ## data Godot reads and `PFALive.ENGINE_VERSION` derives from this line, so the
 ## version announced over Live Connect can never fall behind the addon.
-const VERSION := "0.11.9"
+const VERSION := "0.11.10"
 
 ## Highest config-schema minor this addon implements (the "Versions &
 ## Compatibility" contract is schema v1.1). `_config_refusal` refuses a newer

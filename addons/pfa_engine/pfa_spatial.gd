@@ -714,7 +714,9 @@ func _free_voice(player) -> void:
 		var ev = player.get_meta("event", null)
 		if ev != null and is_instance_valid(ev):
 			ev._unregister_spatial_voice(player)
-		var em = player.get_meta("emitter", null)
+		# A plain trigger_spatial() one-shot carries no emitter, and get_meta with a
+		# null default logs a Godot error for a missing key — ask has_meta first.
+		var em = player.get_meta("emitter") if player.has_meta("emitter") else null
 		if em != null and is_instance_valid(em):
 			em._players.erase(player)
 		player.queue_free()
