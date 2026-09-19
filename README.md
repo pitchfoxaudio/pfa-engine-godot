@@ -415,7 +415,7 @@ Every start/stop/switch path has a floor — `0` always means "as fast as click-
 
 The JS engine's floors are shorter (10–20 ms) because Web Audio schedules sample-accurately; Godot's frame-based timing needs the wider window (~2 frames at 60 fps).
 
-One consequence of frame-based timing worth knowing: a fade is a `Tween`, and a `Tween` steps by the whole delta of the frame it was created in. The process's **first** frame is a long one (scripts compile before the first iteration — a tenth of a second or more), so a sound started from the first scene's `_ready()` has its envelope skip that much at once — and a single `await get_tree().process_frame` does not help, because it resumes *inside* that same long frame. Wait two frames before the first sound (`await get_tree().process_frame` twice — the second one lands in an ordinary frame), or start it from something later: a timer, an input, the next scene.
+One consequence of frame-based timing worth knowing: a fade is a `Tween`, and a `Tween` steps by the whole delta of the frame it was created in. The process's **first** frame is a long one (scripts compile before the first iteration — we measured about 100 ms on a laptop and 150 ms on a Windows desktop), so a sound started from the first scene's `_ready()` has its envelope skip that much at once — and a single `await get_tree().process_frame` does not help, because it resumes *inside* that same long frame. On the 150 ms machine a 150 ms voice started after that one await was never heard at all: it began and ended inside the frame nobody saw. Wait two frames before the first sound (`await get_tree().process_frame` twice — the second one lands in an ordinary frame), or start it from something later: a timer, an input, the next scene.
 
 ---
 
