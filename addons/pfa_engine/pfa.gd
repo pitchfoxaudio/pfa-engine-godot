@@ -20,7 +20,7 @@ extends Node
 ## twin of the web engine's `PFA.VERSION`. THE single literal: `plugin.cfg` is
 ## data Godot reads and `PFALive.ENGINE_VERSION` derives from this line, so the
 ## version announced over Live Connect can never fall behind the addon.
-const VERSION := "0.11.10"
+const VERSION := "0.11.11"
 
 ## Highest config-schema minor this addon implements (the "Versions &
 ## Compatibility" contract is schema v1.1). `_config_refusal` refuses a newer
@@ -680,6 +680,11 @@ func _create_event(event_name: String, data: Dictionary) -> PFAEvent:
 	)
 	event.level_applied.connect(func(level: int):
 		level_changed.emit(event_name, level)
+	)
+	# The graph ending the music by itself (terminal fade after the last repeat)
+	# is a stop like stop_terminal()'s — announced as the fade starts.
+	event.graph_ended.connect(func():
+		event_stopped.emit(event_name)
 	)
 
 	# Find group volume

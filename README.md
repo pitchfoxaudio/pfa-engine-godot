@@ -189,7 +189,7 @@ Volume chain: `clip × track × event × group × master` — all linear, each s
 | Signal | Description |
 |--------|-------------|
 | `event_started(event_name)` | Music event started |
-| `event_stopped(event_name)` | Event stopped |
+| `event_stopped(event_name)` | Event stopped — by `stop()` / `stop_terminal()` / another music event taking over, or by the node graph itself when a section's last repeat runs into its `terminal_fade` (emitted as the fade starts, like `stop_terminal()`) |
 | `level_changed(event_name, level)` | Adaptive level changed — fires when the switch is **applied** (on a `bar`/`beat` quantization that is the boundary, not the `set_level` call) |
 | `sfx_triggered(event_name, played)` | An SFX **actually fired** — not emitted for a refused trigger (cooldown, voice cap, every chance roll failed). `played` as returned by `trigger()`; `[]` for spatial one-shots (their voices carry no report) |
 | `node_changed(event_name, node_id, node_name)` | Active node changed — fires at the **apply point** with the new node, for manual `navigate()`, auto-advance and deferred fade-out switches alike |

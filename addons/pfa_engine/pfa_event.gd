@@ -18,6 +18,12 @@ signal auto_advanced(node_id: String, node_name: String)
 ## must not synthesize this synchronously: on the bar/beat path the move happens later.
 signal node_applied(node_id: String, node_name: String)
 
+## Fired when the node graph ends the music by itself: a section's repeats ran
+## out into its authored terminal fade (no automatic road out). Emitted as the fade
+## starts — the moment the autoload's stop_terminal() announces a stop. Bubbled by
+## the PFA autoload as `event_stopped`. JS: engine.onEventStopped from the timer.
+signal graph_ended()
+
 ## Fired when a level change has ACTUALLY been applied (current_level changed) —
 ## instant path, quantized timer apply, and the not-playing direct set. Bubbled by
 ## the PFA autoload as `level_changed`.
@@ -744,6 +750,12 @@ func stop_with_terminal_fade() -> bool:
 
 ## Fade out and stop. JS: fadeOut()
 func fade_out(duration: float, curve: String = "equal_power") -> void:
+	# An event fading out to stop no longer moves its graph: the section's pending
+	# auto-advance would start a second (terminal) fade behind this one, or walk to
+	# the next section under the release. Nulling the reference cancels (identity
+	# guard in the timer's lambda). JS: clearTimeout at the top of fadeOut().
+	_auto_advance_timer = null
+	_auto_advance_at = -1.0
 	var ramp: Tween = _tween_event_gain(0.0, duration, curve)
 	# Generation, not the old SceneTreeTimer identity: the ramp is the clock now
 	# (_after_ramp), and on the duration<=0 path there is no ramp object to be
@@ -1227,8 +1239,8 @@ func _schedule_auto_advance(node: Dictionary, entry_time: float = -1.0) -> void:
 			return
 		if has_auto:
 			ev._execute_auto_advance(at)
-		else:
-			ev.stop_with_terminal_fade()
+		elif ev.stop_with_terminal_fade():
+			ev.graph_ended.emit()
 	, CONNECT_ONE_SHOT)
 
 ## JS: _executeAutoAdvance(atTime). `at_time` = the endpoint of the repeats
